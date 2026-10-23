@@ -18,6 +18,7 @@ on:
           - lineup
           - manage
           - scout
+          - introspect
 
 jobs:
   run-bot:
@@ -57,7 +58,12 @@ jobs:
           SLEEPER_TOKEN: ${{ secrets.SLEEPER_TOKEN }}
           ENABLE_WRITES: ${{ secrets.ENABLE_WRITES }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python run.py ${{ steps.pick.outputs.cmd }}
+        run: |
+          if [ "${{ steps.pick.outputs.cmd }}" = "introspect" ]; then
+            python introspect.py
+          else
+            python run.py ${{ steps.pick.outputs.cmd }}
+          fi
 
       - name: Upload audit log
         if: always()
