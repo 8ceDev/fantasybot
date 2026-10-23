@@ -52,9 +52,19 @@ def set_lineup():
         return
     all_players = read.all_players()
 
-    candidates = [_player_card(all_players, pid) for pid in (roster.get("players") or [])]
+    # drop empty/zero slots from the player list — Sleeper sometimes carries "0"
+    # as a placeholder for an unfilled roster spot
+    player_ids = [pid for pid in (roster.get("players") or []) if pid and str(pid) != "0"]
+    candidates = [_player_card(all_players, pid) for pid in player_ids]
+
+    # starting slots only — BN (bench) and IR/RES (reserve/injured reserve) get
+    # filled automatically with whoever isn't a starter
+    all_positions = league.get("roster_positions", [])
+    starting_slots = [p for p in all_positions if p not in ("BN", "IR", "RES", "TAXI")]
+
     rec = claude_manager.lineup_decision({
-        "roster_positions": league.get("roster_positions", []),
+        "starting_slots": starting_slots,
+        "num_starters_required": len(starting_slots),
         "candidates": candidates,
     })
 
