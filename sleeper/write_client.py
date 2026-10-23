@@ -147,67 +147,85 @@ class SleeperWrite:
 
     def waiver_claim(self, roster_id: int, add_player_id: str,
                      drop_player_id: str = None, faab_bid: int = 0):
-        """Submit a waiver claim: add a player, optionally drop one, with a FAAB bid.
+        """Submit a FAAB waiver claim: add a player, optionally drop one.
 
-        adds/drops are JSON maps of {player_id: roster_id}.
+        Sleeper's submit_waiver_claim uses parallel key/value LIST args:
+          k_adds=[player_id],  v_adds=[roster_id]   -> who gets added where
+          k_drops=[player_id], v_drops=[roster_id]  -> who gets dropped
+          k_settings=["waiver_bid"], v_settings=[bid]  -> the FAAB bid
         """
-        adds = {add_player_id: int(roster_id)} if add_player_id else {}
-        drops = {drop_player_id: int(roster_id)} if drop_player_id else {}
+        k_adds = [str(add_player_id)] if add_player_id else []
+        v_adds = [int(roster_id)] if add_player_id else []
+        k_drops = [str(drop_player_id)] if drop_player_id else []
+        v_drops = [int(roster_id)] if drop_player_id else []
+        k_settings = ["waiver_bid"]
+        v_settings = [int(faab_bid)]
 
         query = """
-        mutation create_waiver_claim(
-          $league_id: Snowflake!, $roster_id: Int!,
-          $adds: JSON, $drops: JSON, $waiver_budget: Int
+        mutation submit_waiver_claim(
+          $league_id: Snowflake!,
+          $k_adds: [String], $v_adds: [Int],
+          $k_drops: [String], $v_drops: [Int],
+          $k_settings: [String], $v_settings: [Int]
         ) {
-          create_waiver_claim(
-            league_id: $league_id, roster_id: $roster_id,
-            adds: $adds, drops: $drops, waiver_budget: $waiver_budget
+          submit_waiver_claim(
+            league_id: $league_id,
+            k_adds: $k_adds, v_adds: $v_adds,
+            k_drops: $k_drops, v_drops: $v_drops,
+            k_settings: $k_settings, v_settings: $v_settings
           ) {
-            transaction_id status type created adds drops settings
+            transaction_id status type created
           }
         }
         """
         variables = {
             "league_id": self.league_id,
-            "roster_id": int(roster_id),
-            "adds": adds,
-            "drops": drops,
-            "waiver_budget": int(faab_bid),
+            "k_adds": k_adds, "v_adds": v_adds,
+            "k_drops": k_drops, "v_drops": v_drops,
+            "k_settings": k_settings, "v_settings": v_settings,
         }
         return self._graphql(
-            "create_waiver_claim", query, variables,
+            "submit_waiver_claim", query, variables,
             intent=f"waiver add={add_player_id} drop={drop_player_id} bid={faab_bid}",
         )
 
     def add_free_agent(self, roster_id: int, add_player_id: str = None,
                        drop_player_id: str = None):
-        """Free-agent add/drop (no FAAB bid — used outside the waiver period)."""
+        """Instant free-agent add/drop (no FAAB bid — for players not on waivers).
+
+        Uses league_create_transaction with type="free_agent" and the same
+        parallel key/value LIST args as the waiver claim.
+        """
         if not add_player_id and not drop_player_id:
             raise ValueError("Specify at least one of add_player_id or drop_player_id")
-        adds = {add_player_id: int(roster_id)} if add_player_id else {}
-        drops = {drop_player_id: int(roster_id)} if drop_player_id else {}
+        k_adds = [str(add_player_id)] if add_player_id else []
+        v_adds = [int(roster_id)] if add_player_id else []
+        k_drops = [str(drop_player_id)] if drop_player_id else []
+        v_drops = [int(roster_id)] if drop_player_id else []
 
         query = """
-        mutation create_free_agent(
-          $league_id: Snowflake!, $roster_id: Int!,
-          $adds: JSON, $drops: JSON
+        mutation league_create_transaction(
+          $league_id: Snowflake!, $type: String!,
+          $k_adds: [String], $v_adds: [Int],
+          $k_drops: [String], $v_drops: [Int]
         ) {
-          create_free_agent(
-            league_id: $league_id, roster_id: $roster_id,
-            adds: $adds, drops: $drops
+          league_create_transaction(
+            league_id: $league_id, type: $type,
+            k_adds: $k_adds, v_adds: $v_adds,
+            k_drops: $k_drops, v_drops: $v_drops
           ) {
-            transaction_id status type created adds drops
+            transaction_id status type created
           }
         }
         """
         variables = {
             "league_id": self.league_id,
-            "roster_id": int(roster_id),
-            "adds": adds,
-            "drops": drops,
+            "type": "free_agent",
+            "k_adds": k_adds, "v_adds": v_adds,
+            "k_drops": k_drops, "v_drops": v_drops,
         }
         return self._graphql(
-            "create_free_agent", query, variables,
+            "league_create_transaction", query, variables,
             intent=f"free_agent add={add_player_id} drop={drop_player_id}",
         )
 
@@ -262,7 +280,7 @@ class SleeperWrite:
             waiver_budget: $waiver_budget
             expires_at: $expires_at
           ) {
-            transaction_id status type created leg metadata settings
+            transaction_id status type created leg
           }
         }
         """
