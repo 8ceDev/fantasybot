@@ -117,19 +117,27 @@ def draft_pick(context: dict) -> dict:
 
 # ---------- LINEUP ----------
 def lineup_decision(context: dict) -> dict:
-    """context: {roster_positions, candidates: [{player_id,name,pos,status,note,proj}], slots}
+    """context: {starting_slots, num_starters_required, candidates}
     Returns {"starters": [player_id,...ordered by slot], "reserve": [...], "reason": ..., "analysis": ...}"""
+    n = context.get("num_starters_required")
+    slots = context.get("starting_slots", [])
     prompt = (
-        "Set my optimal starting lineup for today. Fill each roster slot with "
-        "the eligible player who maximizes expected fantasy points under my "
-        "league's scoring. Bench anyone not playing today or ruled out. Think "
-        "about who is actually playing tonight and who has the better matchup.\n\n"
-        f"Roster slots to fill (in order): {json.dumps(context.get('roster_positions', []))}\n\n"
-        f"My players today:\n{json.dumps(context.get('candidates', []), indent=2)}\n\n"
-        'Respond as JSON: {"starters": ["<player_id per slot, in slot order>"], '
-        '"reserve": ["<player_id>"], '
-        '"analysis": "<2-4 sentences on your lineup logic — who you benched and why>", '
-        '"reason": "<1 sentence summary>"}'
+        f"Pick my optimal {n} starters for today. I have more players than "
+        f"starting slots — the rest go to the bench automatically. DO NOT "
+        f"include bench players in the starters array. Bench anyone not "
+        f"playing today, ruled out, injured, or clearly worse than the "
+        f"alternatives at their position.\n\n"
+        f"Starting slots (in order, one player per slot): {json.dumps(slots)}\n\n"
+        f"My full roster to choose from:\n{json.dumps(context.get('candidates', []), indent=2)}\n\n"
+        f'CRITICAL: "starters" must be an array of EXACTLY {n} player_ids, '
+        f'one per starting slot in the order listed above. Any player you '
+        f'leave out automatically goes to the bench — do NOT list bench '
+        f'players anywhere. "reserve" is ONLY for players headed to IR '
+        f'(injured/out long-term), or empty [] if none.\n\n'
+        f'Respond as JSON: {{"starters": [{n} player_ids], '
+        f'"reserve": [IR-bound player_ids, or empty], '
+        f'"analysis": "<2-4 sentences on your lineup logic — who you benched and why>", '
+        f'"reason": "<1 sentence summary>"}}'
     )
     return _ask(prompt)
 
