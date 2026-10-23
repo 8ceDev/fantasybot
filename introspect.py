@@ -1,12 +1,9 @@
-"""Diagnostic — ask Sleeper's GraphQL API what mutations it actually accepts.
+"""Diagnostic — show FULL type signatures for the Sleeper mutations we use.
 
-Run this once with your SLEEPER_TOKEN set, and it'll list every mutation
-Sleeper knows about, filtered for things related to waivers/adds/drops/trades.
-We'll use the output to find the correct mutation name for NBA waiver claims.
-
-Note: Sleeper uses snake_case even for standard GraphQL introspection fields
-(mutation_type instead of mutationType, of_type instead of ofType). This
-query is written for Sleeper's conventions, not the GraphQL spec.
+The first pass told us the mutation NAMES (submit_waiver_claim, accept_trade,
+etc.) but collapsed list types, so we couldn't tell if k_adds is `String` or
+`[String]`. This version fully unwraps NON_NULL (!) and LIST ([]) wrappers so
+we can write the exact payloads with zero guesswork.
 
 Usage:
     python introspect.py
@@ -22,6 +19,21 @@ if not TOKEN:
 
 GRAPHQL_URL = "https://sleeper.com/graphql"
 
+# Mutations we actually call (or might switch to). Show their exact signatures.
+TARGETS = [
+    "submit_waiver_claim",
+    "cancel_waiver_claim",
+    "update_waiver_claim",
+    "league_create_transaction",
+    "accept_trade",
+    "reject_trade",
+    "propose_trade",
+    "update_matchup_leg",
+    "roster_update_starters",
+    "roster_update_reserve",
+]
+
+# Unwrap 5 levels deep — more than enough for [String!]! style nesting.
 INTROSPECTION = """
 query IntrospectionQuery {
   __schema {
@@ -30,13 +42,35 @@ query IntrospectionQuery {
         name
         args {
           name
-          type { kind name of_type { name kind } }
+          type {
+            kind name
+            of_type {
+              kind name
+              of_type {
+                kind name
+                of_type { kind name of_type { kind name } }
+              }
+            }
+          }
         }
       }
     }
   }
 }
 """
+
+
+def render_type(t):
+    """Turn a (possibly nested) GraphQL type into a readable string like [String!]!"""
+    if not t:
+        return "?"
+    kind = t.get("kind")
+    if kind == "NON_NULL":
+        return render_type(t.get("of_type")) + "!"
+    if kind == "LIST":
+        return "[" + render_type(t.get("of_type")) + "]"
+    return t.get("name") or kind or "?"
+
 
 resp = requests.post(
     GRAPHQL_URL,
@@ -58,27 +92,15 @@ if "errors" in data and data["errors"]:
     print(json.dumps(data["errors"], indent=2))
     raise SystemExit(1)
 
-mutations = data["data"]["__schema"]["mutation_type"]["fields"]
-print(f"Sleeper has {len(mutations)} mutations total.\n")
+mutations = {m["name"]: m for m in data["data"]["__schema"]["mutation_type"]["fields"]}
 
-# Interesting keywords for us
-KEYWORDS = ["waiver", "free_agent", "add", "drop", "trade", "transaction",
-            "roster", "lineup", "matchup", "claim"]
-
-interesting = []
-for m in mutations:
-    name = m["name"]
-    if any(kw in name.lower() for kw in KEYWORDS):
-        interesting.append(m)
-
-print(f"=== {len(interesting)} relevant mutations ===\n")
-for m in interesting:
-    args_str = ", ".join(
-        f"{a['name']}: {a['type'].get('name') or (a['type'].get('of_type') or {}).get('name') or a['type'].get('kind')}"
-        for a in m["args"]
-    )
-    print(f"  {m['name']}({args_str})")
-
-print("\n=== Full mutation list (grep this for anything we missed) ===")
-for m in mutations:
-    print(f"  {m['name']}")
+print("=== EXACT SIGNATURES for the mutations we use ===\n")
+for name in TARGETS:
+    m = mutations.get(name)
+    if not m:
+        print(f"  {name}: NOT FOUND\n")
+        continue
+    print(f"  {name}(")
+    for a in m["args"]:
+        print(f"      {a['name']}: {render_type(a['type'])}")
+    print("  )\n")
