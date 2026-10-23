@@ -44,6 +44,8 @@ def _player_card(all_players, pid):
 def set_lineup():
     read, write, user_id = _ctx()
     league = read.league(SLEEPER_LEAGUE_ID)
+    state = read.state()
+    week = state.get("week", 1)
     roster = read.my_roster(SLEEPER_LEAGUE_ID, user_id)
     if not roster:
         notify("Couldn't find your roster — has the draft happened yet?")
@@ -71,6 +73,7 @@ def set_lineup():
         return
     write.set_lineup(roster_id=roster["roster_id"],
                      starters=starters,
+                     leg=week,
                      reserve=rec.get("reserve", []))
 
 
@@ -173,4 +176,8 @@ def _handle_trades(read, write, roster, all_players, user_id, week):
         notify(f"🧠 Trade {t.get('transaction_id')}: {verdict} — {rec.get('reason','')}")
         if rec.get("counter"):
             notify(f"   Suggested counter: {rec['counter']}")
-        write.respond_to_trade(t.get("transaction_id"), accept=bool(rec.get("accept")))
+        write.respond_to_trade(
+            transaction_id=t.get("transaction_id"),
+            leg=t.get("leg", week),
+            accept=bool(rec.get("accept")),
+        )
