@@ -22,6 +22,7 @@ break without notice, and may violate Sleeper's ToS. You've accepted that
 import json
 import os
 import re
+import uuid
 import datetime
 import requests
 
@@ -296,3 +297,116 @@ class SleeperWrite:
             "propose_trade", query, variables,
             intent=f"propose_trade adds={adds} drops={drops}",
         )
+
+    # ======================================================================
+    # DIRECT MESSAGES (chat)
+    # DM reads go through _graphql_read (always executes — reads never mutate).
+    # DM sends go through _graphql (dry-run gated like every other write).
+    # ======================================================================
+
+    def _graphql_read(self, operation_name: str, query: str, variables: dict):
+        """Execute a GraphQL READ. Always runs (reads are safe) but needs a token."""
+        if not self.token:
+            raise RuntimeError("DM reads require SLEEPER_TOKEN to be set.")
+        headers = {
+            "authorization": self.token,
+            "content-type": "application/json",
+            "accept": "application/json",
+            "origin": "https://sleeper.com",
+            "referer": "https://sleeper.com/",
+            "x-sleeper-graphql-op": operation_name,
+            "user-agent": "sleeper-ai-manager/1.0",
+        }
+        body = {"operationName": operation_name, "query": query, "variables": variables}
+        r = self._session.post(GRAPHQL_URL, headers=headers, json=body, timeout=15)
+        if r.status_code != 200:
+            raise RuntimeError(f"Sleeper read failed: HTTP {r.status_code}: {r.text[:200]}")
+        data = r.json()
+        if data.get("errors"):
+            raise RuntimeError(f"Sleeper GraphQL read error: {data['errors']}")
+        return data.get("data") or {}
+
+    def my_dms(self):
+        """List my DM threads (pending ones included — we detect pending per-member)."""
+        query = """
+        query my_dms($limit: Int) {
+          my_dms(limit: $limit) {
+            dm_id
+            dm_type
+            title
+            last_message_id
+            last_message_text
+            last_message_time
+            last_author_id
+            last_author_display_name
+            last_author_is_bot
+            last_read_id
+          }
+        }
+        """
+        data = self._graphql_read("my_dms", query, {"limit": 50})
+        return data.get("my_dms") or []
+
+    def dm_members(self, dm_id: str):
+        """Who's in a DM, including whether MY membership is still pending."""
+        query = """
+        query dm_members($dm_id: Snowflake!) {
+          dm_members(dm_id: $dm_id) {
+            user_id
+            display_name
+            real_name
+            is_bot
+            is_owner
+            pending
+          }
+        }
+        """
+        data = self._graphql_read("dm_members", query, {"dm_id": str(dm_id)})
+        return data.get("dm_members") or []
+
+    def dm_messages(self, dm_id: str, limit: int = 15):
+        """Recent messages in a DM, oldest-first, capped to `limit`."""
+        query = """
+        query messages($parent_id: Snowflake!) {
+          messages(parent_id: $parent_id) {
+            message_id
+            author_id
+            author_display_name
+            author_is_bot
+            created
+            text_map
+            parent_type
+          }
+        }
+        """
+        data = self._graphql_read("messages", query, {"parent_id": str(dm_id)})
+        msgs = data.get("messages") or []
+        msgs.sort(key=lambda m: m.get("created") or 0)
+        return msgs[-limit:]
+
+    def send_dm_message(self, dm_id: str, text: str, parent_type: str = "dm"):
+        """Post a message into a DM. Replying also auto-accepts a pending DM."""
+        query = """
+        mutation create_message($text: String, $parent_type: String!,
+                                $parent_id: Snowflake!, $client_id: String) {
+          create_message(text: $text, parent_type: $parent_type,
+                         parent_id: $parent_id, client_id: $client_id) {
+            message_id created author_id
+          }
+        }
+        """
+        variables = {
+            "text": text,
+            "parent_type": parent_type,
+            "parent_id": str(dm_id),
+            "client_id": str(uuid.uuid4()),
+        }
+        return self._graphql(
+            "create_message", query, variables,
+            intent=f"dm_reply dm={dm_id} text={text[:60]!r}",
+        )
+
+    def clear_unread_dms(self):
+        """Mark all DMs read. Best-effort; return type is a scalar so no subselection."""
+        query = "mutation clear_unread_dms { clear_unread_dms }"
+        return self._graphql("clear_unread_dms", query, {}, intent="clear_unread_dms")
