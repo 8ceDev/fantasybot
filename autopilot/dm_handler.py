@@ -14,17 +14,27 @@ eyeball the census and the drafted replies before letting it send for real.
 """
 
 from config import (SLEEPER_LEAGUE_ID, SLEEPER_USERNAME, SLEEPER_SPORT,
-                    SLEEPER_SEASON, SLEEPER_TOKEN, ENABLE_WRITES)
+                    SLEEPER_SEASON, SLEEPER_TOKEN, ENABLE_WRITES,
+                    ENABLE_TRADE_PROPOSALS)
 from sleeper.read_client import SleeperRead
 from sleeper.write_client import SleeperWrite
 from autopilot.weekly_runner import _handle_trades
 from brain import claude_manager
 from brain.notify import notify
 
+OPEN_STATUSES = {"proposed", "pending"}
+
 
 def _pname(all_players, pid):
     p = all_players.get(pid, {})
     return p.get("full_name") or pid
+
+
+def _card(all_players, pid):
+    p = all_players.get(pid, {})
+    return {"player_id": pid, "name": p.get("full_name") or pid,
+            "pos": p.get("fantasy_positions"), "team": p.get("team"),
+            "status": p.get("injury_status") or "OK"}
 
 
 def _extract_text(msg: dict) -> str:
@@ -72,16 +82,29 @@ def handle_dms(preview: bool = False):
     roster_by_owner = {str(r.get("owner_id")): r for r in rosters}
     my_roster = roster_by_owner.get(my_user_id, {})
     my_roster_names = [_pname(all_players, pid) for pid in (my_roster.get("players") or [])]
+    my_roster_cards = [_card(all_players, pid) for pid in (my_roster.get("players") or [])]
+    my_rid = my_roster.get("roster_id")
 
-    # 1) Trades first — accept / negotiate / reject (with their own DMs). This
-    #    returns the proposers it handled so we don't double-message them below.
+    # 1) Formal trades — accept / reject here; negotiate cases are handed back
+    #    for the conversation (and possible counter-proposal) below.
     week = (read.state() or {}).get("week", 1)
     try:
-        trade_proposers = _handle_trades(read, write, my_roster, all_players,
-                                         my_user_id, week, preview=preview)
+        resolved, negotiate_map = _handle_trades(read, write, my_roster, all_players,
+                                                  my_user_id, week, preview=preview)
     except Exception as e:
         notify(f"DM bot: trade pass errored: {e}")
-        trade_proposers = set()
+        resolved, negotiate_map = set(), {}
+
+    # Rosters I already have an OUTSTANDING proposal out to (so we don't re-propose).
+    outbound_rids = set()
+    try:
+        for t in write.get_trades(roster_id=my_rid):
+            if t.get("status") in OPEN_STATUSES and str(t.get("creator")) == my_user_id:
+                for rid in (t.get("roster_ids") or []):
+                    if rid != my_rid:
+                        outbound_rids.add(rid)
+    except Exception:
+        pass
 
     # 2) Banter — reply to everyone else who messaged last.
     replied = 0
@@ -105,9 +128,9 @@ def handle_dms(preview: bool = False):
                       else dm.get("last_author_display_name") or "someone")
         other_id = str(others[0]["user_id"]) if others else None
 
-        # Skip threads the trade handler already owns (active trade with them)
-        if other_id and other_id in trade_proposers:
-            notify(f"  • {other_name}: has an active trade — handled by trade pass.")
+        # Skip threads already resolved by the trade pass (accepted/rejected).
+        if other_id and other_id in resolved:
+            notify(f"  • {other_name}: trade accepted/rejected by trade pass.")
             continue
 
         who_last = "me" if last_author == my_user_id else other_name
@@ -121,6 +144,8 @@ def handle_dms(preview: bool = False):
         # Their roster (if they're a league member) for trade context
         their_roster = roster_by_owner.get(other_id, {})
         their_names = [_pname(all_players, pid) for pid in (their_roster.get("players") or [])]
+        their_cards = [_card(all_players, pid) for pid in (their_roster.get("players") or [])]
+        is_member = bool(their_roster)
 
         # Conversation history (best-effort; fall back to the last message)
         convo, parent_type = "", "dm"
@@ -141,26 +166,92 @@ def handle_dms(preview: bool = False):
         if not convo:
             convo = f"{other_name}: {last_text}"
 
-        # Draft the in-character reply
-        reply = claude_manager.scout_reply({
-            "my_roster": my_roster_names,
-            "their_name": other_name,
-            "their_roster": their_names,
-            "conversation": convo,
-            "latest": last_text,
-        })
-
-        tag = "  [would accept pending DM]" if pending else ""
-        if preview:
-            notify(f"    💬 WOULD reply: {reply}{tag}")
+        # Non-league-members just get banter. League members go through the
+        # negotiator, which can also CLOSE a deal by proposing a trade.
+        if not is_member:
+            reply = claude_manager.scout_reply({
+                "my_roster": my_roster_names, "their_name": other_name,
+                "their_roster": their_names, "conversation": convo, "latest": last_text,
+            })
+            if preview:
+                notify(f"    💬 WOULD reply: {reply}")
+                continue
+            try:
+                write.send_dm_message(dm_id, reply, parent_type=parent_type)
+                replied += 1
+                notify(f"    💬 Replied: {reply}")
+            except Exception as e:
+                notify(f"    ✗ Couldn't send reply: {e}")
             continue
 
-        try:
-            write.send_dm_message(dm_id, reply, parent_type=parent_type)
-            replied += 1
-            notify(f"    💬 Replied: {reply}" + ("  [accepted pending DM]" if pending else ""))
-        except Exception as e:
-            notify(f"    ✗ Couldn't send reply: {e}")
+        rec = claude_manager.negotiate({
+            "my_roster": my_roster_cards,
+            "their_roster": their_cards,
+            "their_name": other_name,
+            "dm_history": convo,
+            "incoming_trade": negotiate_map.get(other_id),
+        })
+        reply = rec.get("message", "")
+        wants_propose = bool(rec.get("propose"))
+
+        # Validate any proposal against the actual rosters before trusting it.
+        send_ids = [p for p in (rec.get("send_player_ids") or [])
+                    if p in (my_roster.get("players") or [])]
+        recv_ids = [p for p in (rec.get("receive_player_ids") or [])
+                    if p in (their_roster.get("players") or [])]
+        their_rid = their_roster.get("roster_id")
+        valid_deal = (wants_propose and send_ids and recv_ids
+                      and len(send_ids) == len(rec.get("send_player_ids") or [])
+                      and len(recv_ids) == len(rec.get("receive_player_ids") or []))
+
+        send_str = ", ".join(_pname(all_players, p) for p in send_ids)
+        recv_str = ", ".join(_pname(all_players, p) for p in recv_ids)
+
+        if wants_propose and not valid_deal:
+            notify(f"    ⚠ {other_name}: proposal referenced players not on the "
+                   f"right rosters — ignoring the proposal, just replying.")
+
+        already_out = their_rid in outbound_rids
+
+        if preview:
+            notify(f"    💬 WOULD reply: {reply}")
+            if valid_deal:
+                blocked = (" [BLOCKED: proposals disabled]" if not ENABLE_TRADE_PROPOSALS
+                           else " [BLOCKED: already have an offer out]" if already_out else "")
+                notify(f"    🤝 WOULD PROPOSE: give [{send_str}] for [{recv_str}]{blocked}")
+                if rec.get("reject_incoming") and negotiate_map.get(other_id):
+                    notify("       (and reject their now-superseded open offer)")
+            continue
+
+        # Fire the proposal if allowed, then message.
+        proposed = False
+        if valid_deal and ENABLE_TRADE_PROPOSALS and not already_out:
+            try:
+                adds = [(p, their_rid) for p in send_ids] + [(p, my_rid) for p in recv_ids]
+                drops = [(p, my_rid) for p in send_ids] + [(p, their_rid) for p in recv_ids]
+                write.propose_trade(adds=adds, drops=drops)
+                outbound_rids.add(their_rid)
+                proposed = True
+                notify(f"    🤝 PROPOSED to {other_name}: give [{send_str}] for [{recv_str}]")
+                # Supersede their stale open offer if the model said so.
+                inc = negotiate_map.get(other_id)
+                if rec.get("reject_incoming") and inc:
+                    write.respond_to_trade(transaction_id=inc.get("transaction_id"),
+                                           leg=inc.get("leg", week), accept=False)
+                    notify("       rejected their superseded open offer.")
+            except Exception as e:
+                notify(f"    ✗ couldn't propose to {other_name}: {e}")
+        elif valid_deal and not ENABLE_TRADE_PROPOSALS:
+            notify(f"    🤝 (agreement reached, but proposals are OFF — set "
+                   f"ENABLE_TRADE_PROPOSALS=true to let it send: [{send_str}] for [{recv_str}])")
+
+        if reply:
+            try:
+                write.send_dm_message(dm_id, reply, parent_type=parent_type)
+                replied += 1
+                notify(f"    💬 Replied: {reply}" + ("  [+ proposed trade]" if proposed else ""))
+            except Exception as e:
+                notify(f"    ✗ Couldn't send reply: {e}")
 
     if not preview and replied:
         try:
