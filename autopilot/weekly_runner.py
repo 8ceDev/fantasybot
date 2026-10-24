@@ -9,12 +9,32 @@ Everything funnels decisions through the Claude brain and actions through the
 write client, which is DRY-RUN unless you've set ENABLE_WRITES=true + a token.
 """
 
+import time
+
 from config import (SLEEPER_LEAGUE_ID, SLEEPER_USERNAME, SLEEPER_SPORT,
                     SLEEPER_SEASON, SLEEPER_TOKEN, ENABLE_WRITES)
 from sleeper.read_client import SleeperRead
 from sleeper.write_client import SleeperWrite
 from brain import claude_manager
 from brain.notify import notify
+
+# How long a trade can sit in "negotiate" before we close it out as stale.
+NEGOTIATION_MAX_DAYS = 3
+
+
+def _dm_text(m: dict) -> str:
+    """Extract readable text from a DM message's text_map blob."""
+    tm = m.get("text_map")
+    if isinstance(tm, dict):
+        for k in ("en", "text", "default", "value", "body"):
+            if tm.get(k):
+                return str(tm[k])
+        for v in tm.values():
+            if isinstance(v, str) and v:
+                return v
+    if isinstance(tm, str) and tm:
+        return tm
+    return ""
 
 
 def _ctx():
@@ -165,45 +185,113 @@ def _handle_waivers(read, write, roster, all_players):
                 notify(f"   ✗ Waiver claim failed: {e}")
 
 
-def _handle_trades(read, write, roster, all_players, user_id, week):
+def _handle_trades(read, write, roster, all_players, user_id, week, preview=False):
+    """Decide and act on incoming trades: accept / negotiate / reject, each with
+    an in-character DM follow-up where a DM is reachable.
+
+    - accept   -> accept_trade + curt confirmation DM
+    - reject   -> reject_trade + snarky brush-off DM
+    - negotiate-> leave the trade pending, DM what would make it work (only when
+                  it's our turn, so we don't nag the same offer every run).
+                  If it's dragged past NEGOTIATION_MAX_DAYS, close it as stale.
+
+    Returns the set of proposer user_ids handled, so the banter loop can skip them.
+    """
     txns = read.transactions(SLEEPER_LEAGUE_ID, week)
     rosters = read.rosters(SLEEPER_LEAGUE_ID)
     roster_by_id = {r["roster_id"]: r for r in rosters}
+    name_by_uid = {str(u.get("user_id")): u.get("display_name")
+                   for u in read.league_users(SLEEPER_LEAGUE_ID)}
 
     pending = [t for t in txns
                if t.get("type") == "trade" and t.get("status") == "pending"]
     incoming = [t for t in pending if roster["roster_id"] in (t.get("roster_ids") or [])
                 and t.get("creator") != user_id]
 
+    handled = set()
     if not incoming:
-        return
+        return handled
 
+    now = time.time()
     for t in incoming:
-        # adds/drops describe who goes where: {player_id: roster_id}
+        tx_id = t.get("transaction_id")
+        leg = t.get("leg", week)
+        other_ids = [rid for rid in (t.get("roster_ids") or []) if rid != roster["roster_id"]]
+        their_roster = roster_by_id.get(other_ids[0], {}) if other_ids else {}
+        proposer_uid = str(their_roster.get("owner_id") or "")
+        if proposer_uid:
+            handled.add(proposer_uid)
+        proposer_name = name_by_uid.get(proposer_uid, "a leaguemate")
+
         incoming_desc = {
-            "transaction_id": t.get("transaction_id"),
+            "transaction_id": tx_id,
             "adds": {_name(all_players, pid): rid for pid, rid in (t.get("adds") or {}).items()},
             "drops": {_name(all_players, pid): rid for pid, rid in (t.get("drops") or {}).items()},
             "draft_picks": t.get("draft_picks"),
         }
-        other_ids = [rid for rid in (t.get("roster_ids") or []) if rid != roster["roster_id"]]
-        their_roster = roster_by_id.get(other_ids[0], {}) if other_ids else {}
+
+        # Reachable DM with the proposer (accepted threads only) for context + replies
+        dm = write.find_dm_with(user_id, proposer_uid) if proposer_uid else None
+        dm_history = "(none)"
+        if dm and dm.get("dm_id"):
+            try:
+                msgs = write.dm_messages(dm["dm_id"], limit=12)
+                lines = []
+                for m in msgs:
+                    who = "me" if str(m.get("author_id")) == str(user_id) else proposer_name
+                    txt = _dm_text(m)
+                    if txt:
+                        lines.append(f"{who}: {txt}")
+                if lines:
+                    dm_history = "\n".join(lines)
+            except Exception:
+                pass
 
         rec = claude_manager.evaluate_trade({
             "incoming_trade": incoming_desc,
             "my_roster": [_player_card(all_players, pid) for pid in (roster.get("players") or [])],
             "their_roster": [_player_card(all_players, pid) for pid in (their_roster.get("players") or [])],
+            "their_name": proposer_name,
+            "dm_history": dm_history,
         })
         if rec.get("_parse_error"):
-            notify(f"Trade {t.get('transaction_id')}: couldn't parse brain output.")
+            notify(f"Trade {tx_id}: couldn't parse brain output.")
             continue
 
-        verdict = "ACCEPT" if rec.get("accept") else "REJECT"
-        notify(f"🧠 Trade {t.get('transaction_id')}: {verdict} — {rec.get('reason','')}")
-        if rec.get("counter"):
-            notify(f"   Suggested counter: {rec['counter']}")
-        write.respond_to_trade(
-            transaction_id=t.get("transaction_id"),
-            leg=t.get("leg", week),
-            accept=bool(rec.get("accept")),
-        )
+        decision = (rec.get("decision") or "reject").lower()
+        dm_message = rec.get("dm_message", "")
+
+        # Stale negotiation -> close it out
+        created_s = (t.get("created") or 0) / 1000.0
+        age_days = (now - created_s) / 86400.0 if created_s else 0
+        if decision == "negotiate" and age_days > NEGOTIATION_MAX_DAYS:
+            decision = "reject"
+            rec["reason"] = (rec.get("reason", "") + " [stale — closing it out]").strip()
+            dm_message = dm_message or "This has sat too long with no movement. I'm out."
+
+        # During a live negotiation, only message when they spoke last (anti-spam).
+        our_turn = (not dm) or (str(dm.get("last_author_id")) != str(user_id))
+        send_dm = bool(dm) and bool(dm_message) and (decision in ("accept", "reject") or our_turn)
+
+        notify(f"🧠 Trade {tx_id} from {proposer_name}: {decision.upper()} — {rec.get('reason','')}")
+
+        if preview:
+            if dm_message:
+                reach = "" if dm else "  (no reachable DM — would skip send)"
+                notify(f"    💬 WOULD DM: {dm_message}{reach}")
+            continue
+
+        if decision == "accept":
+            write.respond_to_trade(transaction_id=tx_id, leg=leg, accept=True)
+        elif decision == "reject":
+            write.respond_to_trade(transaction_id=tx_id, leg=leg, accept=False)
+        # negotiate -> leave the trade pending (no formal action)
+
+        if send_dm:
+            try:
+                write.send_dm_message(dm["dm_id"], dm_message)
+                notify(f"    💬 DM'd {proposer_name}: {dm_message}")
+            except Exception as e:
+                notify(f"    ✗ couldn't DM {proposer_name}: {e}")
+
+    return handled
