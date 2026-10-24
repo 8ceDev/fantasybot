@@ -1,48 +1,63 @@
-"""Diagnostic — show the RETURN field shapes of the DM/message endpoints.
+"""Discovery — find where PENDING / unaccepted DM invites live.
 
-We know the DM query/mutation names and args now. The last missing piece is
-what fields a DM object and a Message object actually expose, so our GraphQL
-selections ask for real fields instead of erroring. This resolves the return
-type of each key endpoint and prints that type's fields.
+my_dms only returns DMs we've already accepted, so a first-time trade request
+from a new person is invisible there. This script hunts for it two ways:
 
-Usage:
-    python introspect.py
+  1. Introspects the return shapes of get_dm_by_members / requests /
+     inbound_requests / outbound_requests (candidate "pending invite" lists).
+  2. Empirically probes get_dm_by_members(me, X) for EVERY league member, and
+     reports which ones have a DM and whether our membership is still pending.
+
+Since you have a hidden trade request right now, #2 should surface it and tell
+us the exact dm_id + pending state — which is everything we need to rebuild the
+handler to catch and auto-accept these.
+
+Usage:  python introspect.py
 """
 
 import os
 import json
+import base64
 import requests
 
 TOKEN = os.environ.get("SLEEPER_TOKEN")
-if not TOKEN:
-    raise SystemExit("Set SLEEPER_TOKEN env var first.")
+LEAGUE_ID = os.environ.get("SLEEPER_LEAGUE_ID")
+if not TOKEN or not LEAGUE_ID:
+    raise SystemExit("Need SLEEPER_TOKEN and SLEEPER_LEAGUE_ID env vars.")
 
 GRAPHQL_URL = "https://sleeper.com/graphql"
+REST = "https://api.sleeper.app/v1"
 
-# Endpoints whose return type we want to see the fields of.
-QUERY_TARGETS = ["my_dms", "messages", "dm", "dm_members", "message"]
-MUTATION_TARGETS = ["create_message", "create_dm"]
 
-INTROSPECTION = """
-query {
-  __schema {
-    query_type { fields { name type { kind name of_type { kind name of_type { kind name } } } } }
-    mutation_type { fields { name type { kind name of_type { kind name of_type { kind name } } } } }
-    types {
-      kind
-      name
-      fields {
-        name
-        type { kind name of_type { kind name of_type { kind name } } }
-      }
-    }
-  }
-}
-"""
+def decode_jwt(tok):
+    body = tok.split(".")[1]
+    body += "=" * (-len(body) % 4)
+    return json.loads(base64.urlsafe_b64decode(body.encode()))
+
+
+MY_ID = str(decode_jwt(TOKEN)["user_id"])
+print(f"My user_id: {MY_ID}\n")
+
+
+def gql(op, query, variables):
+    r = requests.post(
+        GRAPHQL_URL,
+        headers={
+            "authorization": TOKEN,
+            "content-type": "application/json",
+            "accept": "application/json",
+            "origin": "https://sleeper.com",
+            "referer": "https://sleeper.com/",
+            "x-sleeper-graphql-op": op,
+            "user-agent": "sleeper-ai-manager/1.0",
+        },
+        json={"operationName": op, "query": query, "variables": variables},
+        timeout=30,
+    )
+    return r.json()
 
 
 def unwrap_name(t):
-    """Drill through LIST/NON_NULL wrappers to the underlying named type."""
     while t:
         if t.get("name"):
             return t["name"]
@@ -61,58 +76,80 @@ def render_type(t):
     return t.get("name") or k or "?"
 
 
-resp = requests.post(
-    GRAPHQL_URL,
-    headers={
-        "authorization": TOKEN,
-        "content-type": "application/json",
-        "accept": "application/json",
-        "origin": "https://sleeper.com",
-        "referer": "https://sleeper.com/",
-        "x-sleeper-graphql-op": "IntrospectionQuery",
-        "user-agent": "sleeper-ai-manager/1.0",
-    },
-    json={"operationName": None, "query": INTROSPECTION, "variables": {}},
-    timeout=30,
-)
-data = resp.json()
-if "errors" in data and data["errors"]:
-    print("GraphQL errors:")
-    print(json.dumps(data["errors"], indent=2))
-    raise SystemExit(1)
+# ---- 1. Introspect candidate "pending invite" queries ----
+INTRO = """
+query {
+  __schema {
+    query_type { fields { name args { name type { kind name of_type { kind name of_type { kind name } } } }
+                          type { kind name of_type { kind name of_type { kind name } } } } }
+    types { name fields { name type { kind name of_type { kind name of_type { kind name } } } } }
+  }
+}
+"""
+intro = gql("x", INTRO, {})
+if intro.get("errors"):
+    print("introspection errors:", json.dumps(intro["errors"], indent=2))
+else:
+    schema = intro["data"]["__schema"]
+    qf = {f["name"]: f for f in schema["query_type"]["fields"]}
+    types_by_name = {t["name"]: t for t in schema["types"] if t.get("name")}
+    print("=== Candidate invite/request queries ===\n")
+    for name in ["get_dm_by_members", "requests", "inbound_requests", "outbound_requests"]:
+        f = qf.get(name)
+        if not f:
+            print(f"  {name}: NOT FOUND\n")
+            continue
+        args = ", ".join(f"{a['name']}: {render_type(a['type'])}" for a in f["args"])
+        rtn = unwrap_name(f["type"])
+        print(f"  {name}({args}) -> {rtn}")
+        t = types_by_name.get(rtn)
+        if t and t.get("fields"):
+            for fld in t["fields"]:
+                print(f"       {fld['name']}: {render_type(fld['type'])}")
+        print()
 
-schema = data["data"]["__schema"]
-q_fields = {f["name"]: f for f in schema["query_type"]["fields"]}
-m_fields = {f["name"]: f for f in schema["mutation_type"]["fields"]}
-types_by_name = {t["name"]: t for t in schema["types"] if t.get("name")}
+# ---- 2. Probe get_dm_by_members for every league member ----
+print("=== Per-member DM probe (finds hidden/pending DMs) ===\n")
+rosters = requests.get(f"{REST}/league/{LEAGUE_ID}/rosters", timeout=20).json() or []
+users = requests.get(f"{REST}/league/{LEAGUE_ID}/users", timeout=20).json() or []
+name_by_id = {str(u["user_id"]): u.get("display_name") for u in users}
+owner_ids = [str(r["owner_id"]) for r in rosters if r.get("owner_id")]
 
-# Resolve each target endpoint -> its return type name
-print("=== Endpoint return types ===\n")
-wanted_types = set()
-for name in QUERY_TARGETS:
-    f = q_fields.get(name)
-    if f:
-        tn = unwrap_name(f["type"])
-        wanted_types.add(tn)
-        print(f"  query {name} -> {tn}")
-for name in MUTATION_TARGETS:
-    f = m_fields.get(name)
-    if f:
-        tn = unwrap_name(f["type"])
-        wanted_types.add(tn)
-        print(f"  mutation {name} -> {tn}")
+PROBE = """
+query get_dm_by_members($members: [Snowflake]) {
+  get_dm_by_members(members: $members) {
+    dm_id dm_type last_message_id last_read_id last_author_id last_message_text
+  }
+}
+"""
+MEMBERS_Q = """
+query dm_members($dm_id: Snowflake!) {
+  dm_members(dm_id: $dm_id) { user_id display_name pending }
+}
+"""
 
-# Print the fields of each resolved type
-print("\n=== Fields of those types ===")
-for tn in sorted(x for x in wanted_types if x):
-    t = types_by_name.get(tn)
-    if not t:
-        print(f"\n  {tn}: (not an object type / no fields)")
+for oid in owner_ids:
+    if oid == MY_ID:
         continue
-    fields = t.get("fields")
-    if not fields:
-        print(f"\n  {tn}: (no fields — scalar or enum)")
-        continue
-    print(f"\n  {tn}:")
-    for fld in fields:
-        print(f"      {fld['name']}: {render_type(fld['type'])}")
+    nm = name_by_id.get(oid, oid)
+    try:
+        data = gql("get_dm_by_members", PROBE, {"members": [MY_ID, oid]})
+        if data.get("errors"):
+            print(f"  {nm} ({oid}): error {data['errors'][0].get('message')}")
+            continue
+        dm = (data.get("data") or {}).get("get_dm_by_members")
+        if not dm:
+            print(f"  {nm} ({oid}): no DM")
+            continue
+        dm_id = dm.get("dm_id")
+        unread = str(dm.get("last_message_id") or "") != str(dm.get("last_read_id") or "")
+        # check my pending status
+        pend = None
+        md = gql("dm_members", MEMBERS_Q, {"dm_id": str(dm_id)})
+        for m in ((md.get("data") or {}).get("dm_members") or []):
+            if str(m.get("user_id")) == MY_ID:
+                pend = m.get("pending")
+        print(f"  {nm}: dm_id={dm_id} pending={pend} unread={unread} "
+              f"last=\"{(dm.get('last_message_text') or '')[:45]}\"")
+    except Exception as e:
+        print(f"  {nm} ({oid}): exception {e}")
