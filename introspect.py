@@ -1,15 +1,11 @@
-"""Discovery v2 — locate the PENDING DM-invite inbox.
+"""Discovery v3 — locate the pending DM-invite inbox WITHOUT heavy introspection.
 
-get_dm_by_members can't see unaccepted DMs (it errors "doesn't exist"), so the
-invite from a first-time messager lives in a separate inbox. Likely candidates:
-inbound_requests, requests, my_channels, channels_for_user, search_dms.
+Sleeper's full-schema introspection keeps internal-server-erroring. So instead
+of introspecting, we probe each candidate query directly using __typename (a
+meta-field valid on any object), discover its return type, then read its fields
+with a single targeted __type lookup, then actually call it and dump the result.
 
-This probes each one with LIGHT queries (the previous full-schema dump crashed
-Sleeper with an internal error). For each candidate it:
-  1. introspects just that field's args + return type (targeted, light)
-  2. introspects that return type's scalar fields (targeted __type)
-  3. actually CALLS it and dumps the raw result, so we can see if the pending
-     request from ryansanchez999 shows up and what its dm_id is.
+Goal: find the inbox holding ryansanchez999's unaccepted request + its dm_id.
 
 Usage:  python introspect.py
 """
@@ -24,9 +20,7 @@ if not TOKEN:
     raise SystemExit("Need SLEEPER_TOKEN env var.")
 
 GRAPHQL_URL = "https://sleeper.com/graphql"
-
-CANDIDATES = ["inbound_requests", "requests", "outbound_requests",
-              "my_channels", "channels_for_user", "search_dms"]
+CANDIDATES = ["inbound_requests", "requests", "my_channels", "my_dms"]
 
 
 def decode_jwt(tok):
@@ -57,119 +51,89 @@ def gql(op, query, variables=None):
     try:
         return r.json()
     except Exception:
-        return {"errors": [{"message": f"HTTP {r.status_code}: {r.text[:120]}"}]}
+        return {"errors": {"message": f"HTTP {r.status_code}: {r.text[:120]}"}}
 
 
-def unwrap_kind_name(t):
-    while t and t.get("kind") in ("NON_NULL", "LIST"):
-        t = t.get("of_type")
-    return (t or {}).get("name")
+def errmsg(res):
+    e = res.get("errors")
+    if isinstance(e, dict):
+        return e.get("message")
+    if isinstance(e, list) and e:
+        first = e[0]
+        return first.get("message") if isinstance(first, dict) else str(first)
+    return None
 
 
-def render_type(t):
-    if not t:
-        return "?"
-    k = t.get("kind")
-    if k == "NON_NULL":
-        return render_type(t.get("of_type")) + "!"
-    if k == "LIST":
-        return "[" + render_type(t.get("of_type")) + "]"
-    return t.get("name") or k or "?"
+# arg configurations to try for each candidate (name -> graphql call args, variables)
+ARG_TRIES = [
+    ("", {}),
+    ("(limit: 50)", {}),
+    ("(user_id: $uid)", {"uid": MY_ID}),
+]
 
 
-# Light: just the query_type field defs (no `types` dump — that's what crashed)
-Q_FIELDS = """
-query {
-  __schema {
-    query_type {
-      fields {
-        name
-        args { name type { kind name of_type { kind name of_type { kind name } } } }
-        type { kind name of_type { kind name of_type { kind name } } }
-      }
-    }
-  }
-}
-"""
-res = gql("qf", Q_FIELDS)
-if res.get("errors"):
-    print("query_type introspection failed:", res["errors"][:1])
-    raise SystemExit(1)
-qf = {f["name"]: f for f in res["data"]["__schema"]["query_type"]["fields"]}
+def discover_typename(cand):
+    """Find a working arg set + the return typename via __typename."""
+    for call_args, variables in ARG_TRIES:
+        vdef = "($uid: Snowflake!)" if "$uid" in call_args else ""
+        q = f"query probe{vdef} {{ {cand}{call_args} {{ __typename }} }}"
+        r = gql("probe", q, variables)
+        if r.get("errors"):
+            continue
+        payload = (r.get("data") or {}).get(cand)
+        if payload is None:
+            return call_args, variables, None, None  # callable, returns null
+        if isinstance(payload, list):
+            tn = payload[0]["__typename"] if payload else "EMPTY_LIST"
+            return call_args, variables, tn, len(payload)
+        if isinstance(payload, dict):
+            return call_args, variables, payload.get("__typename"), 1
+    return None, None, None, None
 
 
-def type_scalar_fields(type_name):
-    """Return (all_field_render, scalar_field_names) for an object type."""
-    q = """
-    query t($n: String!) {
-      __type(name: $n) {
-        name kind
-        fields { name type { kind name of_type { kind name of_type { kind name } } } }
-      }
-    }
-    """
+def type_fields(type_name):
+    q = """query t($n: String!) { __type(name: $n) {
+             fields { name type { kind name of_type { kind name of_type { kind name } } } } } }"""
     r = gql("t", q, {"n": type_name})
     t = (r.get("data") or {}).get("__type")
     if not t or not t.get("fields"):
         return [], []
-    rendered, scalars = [], []
+    scalars = []
+    rendered = []
     for f in t["fields"]:
-        rendered.append(f"{f['name']}: {render_type(f['type'])}")
         tt = f["type"]
+        depth = ""
         while tt and tt.get("kind") in ("NON_NULL", "LIST"):
             tt = tt.get("of_type")
-        if tt and tt.get("kind") in ("SCALAR", "ENUM"):
+        kind = (tt or {}).get("kind")
+        nm = (tt or {}).get("name")
+        rendered.append(f"{f['name']}:{nm or kind}")
+        if kind in ("SCALAR", "ENUM"):
             scalars.append(f["name"])
     return rendered, scalars
 
 
-for name in CANDIDATES:
-    print(f"\n{'='*60}\n{name}\n{'='*60}")
-    f = qf.get(name)
-    if not f:
-        print("  NOT FOUND in schema")
+for cand in CANDIDATES:
+    print(f"\n{'='*60}\n{cand}\n{'='*60}")
+    call_args, variables, typename, count = discover_typename(cand)
+    if call_args is None:
+        print("  not callable with any tried arg set (needs other required args)")
         continue
-    args_meta = f["args"]
-    args_str = ", ".join(f"{a['name']}: {render_type(a['type'])}" for a in args_meta)
-    rtn = unwrap_kind_name(f["type"])
-    print(f"  signature: {name}({args_str}) -> {rtn}")
+    print(f"  callable as: {cand}{call_args}  -> type={typename}  count={count}")
+    if not typename or typename in ("EMPTY_LIST",):
+        print("  (returned null/empty — nothing in this inbox right now)")
+        continue
 
-    rendered, scalars = type_scalar_fields(rtn) if rtn else ([], [])
+    rendered, scalars = type_fields(typename)
     if rendered:
-        print(f"  {rtn} fields: {', '.join(rendered)}")
+        print(f"  {typename} fields: {', '.join(rendered)}")
 
-    # Build + run a real call
-    var_defs, call_args, variables = [], [], {}
-    blocked = None
-    for a in args_meta:
-        an, at = a["name"], render_type(a["type"])
-        if "user_id" in an:
-            var_defs.append(f"${an}: {at.rstrip('!')}")
-            call_args.append(f"{an}: ${an}")
-            variables[an] = MY_ID
-        elif an == "limit":
-            var_defs.append(f"${an}: {at.rstrip('!')}")
-            call_args.append(f"{an}: ${an}")
-            variables[an] = 50
-        elif an == "term":
-            var_defs.append(f"${an}: {at.rstrip('!')}")
-            call_args.append(f"{an}: ${an}")
-            variables[an] = ""
-        elif at.endswith("!"):
-            blocked = f"{an}:{at}"
-    if blocked:
-        print(f"  (skipping call — needs required arg {blocked})")
-        continue
-
-    sel = " ".join(scalars[:12]) if scalars else ""
-    vd = ("(" + ", ".join(var_defs) + ")") if var_defs else ""
-    ca = ("(" + ", ".join(call_args) + ")") if call_args else ""
-    sel_block = (" { " + sel + " }") if sel else ""
-    call_q = f"query {name}{vd} {{ {name}{ca}{sel_block} }}"
-    r = gql(name, call_q, variables)
+    sel = " ".join(scalars[:14]) if scalars else "__typename"
+    vdef = "($uid: Snowflake!)" if "$uid" in call_args else ""
+    q = f"query dump{vdef} {{ {cand}{call_args} {{ {sel} }} }}"
+    r = gql("dump", q, variables)
     if r.get("errors"):
-        print(f"  CALL error: {r['errors'][0].get('message')}")
+        print(f"  dump error: {errmsg(r)}")
     else:
-        payload = (r.get("data") or {}).get(name)
-        txt = json.dumps(payload, indent=2)
-        print(f"  CALL result: {txt[:1200]}")
+        payload = (r.get("data") or {}).get(cand)
+        print(f"  RESULT:\n{json.dumps(payload, indent=2)[:1500]}")
