@@ -25,6 +25,11 @@ SLEEPER_SEASON = _get("SLEEPER_SEASON", "2026")
 SLEEPER_TOKEN = _get("SLEEPER_TOKEN")
 ENABLE_WRITES = _get("ENABLE_WRITES", "false").lower() == "true"
 
+# Letting the bot PROPOSE trades on its own (give players away) is the riskiest
+# capability it has, so it's gated behind its own flag — separate from, and in
+# addition to, ENABLE_WRITES. Leave false until you've watched it in preview.
+ENABLE_TRADE_PROPOSALS = _get("ENABLE_TRADE_PROPOSALS", "false").lower() == "true"
+
 # ---- Notifications ----
 DISCORD_WEBHOOK_URL = _get("DISCORD_WEBHOOK_URL")
 
