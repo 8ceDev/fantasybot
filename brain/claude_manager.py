@@ -59,40 +59,91 @@ STRATEGIC PRINCIPLES — weigh these for every decision:
    Only accept trades where YOU get clearly more total value by this league's
    scoring, or that fill a positional hole. If close, counter.
 
+WEB SEARCH — you have a live web_search tool. Basketball changes daily, and
+your training knowledge is stale, so BEFORE deciding you must look up anything
+time-sensitive you don't reliably know for TODAY:
+  - Tonight's NBA schedule — which of the relevant players actually play today
+    (and who's on a back-to-back). This is critical for daily lineups.
+  - Current injury status, minutes, and starting role (search "<player> injury
+    status" / "<team> starting lineup tonight").
+  - Recent form, usage, and role changes over the last week or two.
+  - Breaking news that affects value (trades, suspensions, load management).
+Search efficiently (a few targeted queries), ground your decision in what you
+find, and don't search for timeless facts you already know. Prefer recent,
+reputable sources (ESPN, Rotowire, official team/NBA pages, beat writers).
+
 REASONING PROCESS — follow before every decision:
   Step 1 — What is the actual goal? (optimize daily lineup, fill PG hole, etc.)
-  Step 2 — What are the top 2-3 options?
-  Step 3 — For each: estimate expected fantasy points under THIS league's scoring,
+  Step 2 — Search for the live facts that bear on it (schedule, injuries, form).
+  Step 3 — What are the top 2-3 options?
+  Step 4 — For each: estimate expected fantasy points under THIS league's scoring,
             weighted by games this week and injury risk.
-  Step 4 — Pick the option with the best EV. Break ties toward upside or floor
-            as the situation calls for.
-  Step 5 — Note what could make this decision wrong, and whether to hedge.
+  Step 5 — Pick the best EV. Break ties toward upside or floor as fits. Note what
+            could make this wrong.
 
 OUTPUT FORMAT:
-Respond with a SINGLE valid JSON object and nothing else. No prose outside
-the JSON. No markdown fences. Every response must include an "analysis" field
-(2-4 sentences showing your reasoning) and a "reason" field (one-sentence
-summary suitable for a notification)."""
+Do any web searches FIRST. Then your FINAL message must be a SINGLE valid JSON
+object and nothing else — no prose around it, no markdown fences. Every response
+must include an "analysis" field (2-4 sentences, citing what you found) and a
+"reason" field (one-sentence summary for a notification)."""
+
+
+# Anthropic's server-side web search tool. The model autonomously issues
+# searches during the response; results are fetched server-side and fed back.
+WEB_SEARCH_TOOL = {
+    "type": "web_search_20250305",
+    "name": "web_search",
+    "max_uses": 6,
+}
+
+
+def _create(system: str, user_prompt: str, max_tokens: int):
+    """Call the model with web search enabled, falling back to no-tools if the
+    account/model can't use web search (so a search outage never kills a run)."""
+    base = dict(
+        model=CLAUDE_MODEL,
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+    try:
+        return _client.messages.create(tools=[WEB_SEARCH_TOOL], **base)
+    except Exception:
+        return _client.messages.create(**base)
+
+
+def _text_blocks(resp):
+    """All non-empty text blocks, in order. With web search the response also
+    contains server_tool_use / web_search_tool_result blocks, which we skip."""
+    return [b.text for b in resp.content if getattr(b, "type", None) == "text" and b.text.strip()]
+
+
+def _parse_json(text: str) -> dict:
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("```", 2)[1]
+        if t.startswith("json"):
+            t = t[4:]
+        t = t.strip().rstrip("`").strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        pass
+    # The model may emit search commentary before the JSON — extract the object.
+    start, end = t.find("{"), t.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(t[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+    return {"_raw": text, "_parse_error": True}
 
 
 def _ask(user_prompt: str, max_tokens: int = 4000) -> dict:
-    resp = _client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=max_tokens,
-        system=SYSTEM,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    text = "".join(block.text for block in resp.content if block.type == "text").strip()
-    # strip markdown fences if the model added them
-    if text.startswith("```"):
-        text = text.split("```", 2)[1]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.strip().rstrip("`").strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return {"_raw": text, "_parse_error": True}
+    resp = _create(SYSTEM, user_prompt, max_tokens)
+    # Join all text (the JSON is the final block; extractor handles any preamble).
+    text = "\n".join(_text_blocks(resp)).strip()
+    return _parse_json(text)
 
 
 # ---------- DRAFT ----------
@@ -178,6 +229,10 @@ HARD RULES:
 - NEVER break character into helpful-assistant mode. Never explain yourself at length. Never write a paragraph. No emoji unless you're mocking.
 - Gruff, witty, dismissive is fine. Cruel or personal is not.
 
+You have a web_search tool: if a trade or claim hinges on a player's current
+injury, role, or recent form, do a quick search to check before you commit to a
+stance — but keep the reply itself terse no matter what you find.
+
 Reply with ONLY your next DM message — no quotes, no name labels, just the message text."""
 
 
@@ -191,14 +246,11 @@ def scout_reply(context: dict) -> str:
         f"Their latest message: {context.get('latest', '')}\n\n"
         "Write your reply now — 1-2 sentences, fully in character:"
     )
-    resp = _client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=300,
-        system=SCOUT_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = "".join(block.text for block in resp.content if block.type == "text").strip()
-    # strip wrapping quotes the model sometimes adds
+    # max_tokens higher than the reply needs, to leave room for search steps.
+    resp = _create(SCOUT_SYSTEM, prompt, max_tokens=1500)
+    blocks = _text_blocks(resp)
+    # The reply is the LAST text block (anything earlier is search commentary).
+    text = blocks[-1].strip() if blocks else ""
     if len(text) >= 2 and text[0] == text[-1] == '"':
         text = text[1:-1].strip()
     return text
