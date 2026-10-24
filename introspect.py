@@ -1,16 +1,15 @@
-"""Discovery — find where PENDING / unaccepted DM invites live.
+"""Discovery v2 — locate the PENDING DM-invite inbox.
 
-my_dms only returns DMs we've already accepted, so a first-time trade request
-from a new person is invisible there. This script hunts for it two ways:
+get_dm_by_members can't see unaccepted DMs (it errors "doesn't exist"), so the
+invite from a first-time messager lives in a separate inbox. Likely candidates:
+inbound_requests, requests, my_channels, channels_for_user, search_dms.
 
-  1. Introspects the return shapes of get_dm_by_members / requests /
-     inbound_requests / outbound_requests (candidate "pending invite" lists).
-  2. Empirically probes get_dm_by_members(me, X) for EVERY league member, and
-     reports which ones have a DM and whether our membership is still pending.
-
-Since you have a hidden trade request right now, #2 should surface it and tell
-us the exact dm_id + pending state — which is everything we need to rebuild the
-handler to catch and auto-accept these.
+This probes each one with LIGHT queries (the previous full-schema dump crashed
+Sleeper with an internal error). For each candidate it:
+  1. introspects just that field's args + return type (targeted, light)
+  2. introspects that return type's scalar fields (targeted __type)
+  3. actually CALLS it and dumps the raw result, so we can see if the pending
+     request from ryansanchez999 shows up and what its dm_id is.
 
 Usage:  python introspect.py
 """
@@ -21,12 +20,13 @@ import base64
 import requests
 
 TOKEN = os.environ.get("SLEEPER_TOKEN")
-LEAGUE_ID = os.environ.get("SLEEPER_LEAGUE_ID")
-if not TOKEN or not LEAGUE_ID:
-    raise SystemExit("Need SLEEPER_TOKEN and SLEEPER_LEAGUE_ID env vars.")
+if not TOKEN:
+    raise SystemExit("Need SLEEPER_TOKEN env var.")
 
 GRAPHQL_URL = "https://sleeper.com/graphql"
-REST = "https://api.sleeper.app/v1"
+
+CANDIDATES = ["inbound_requests", "requests", "outbound_requests",
+              "my_channels", "channels_for_user", "search_dms"]
 
 
 def decode_jwt(tok):
@@ -39,7 +39,7 @@ MY_ID = str(decode_jwt(TOKEN)["user_id"])
 print(f"My user_id: {MY_ID}\n")
 
 
-def gql(op, query, variables):
+def gql(op, query, variables=None):
     r = requests.post(
         GRAPHQL_URL,
         headers={
@@ -51,18 +51,19 @@ def gql(op, query, variables):
             "x-sleeper-graphql-op": op,
             "user-agent": "sleeper-ai-manager/1.0",
         },
-        json={"operationName": op, "query": query, "variables": variables},
+        json={"operationName": op, "query": query, "variables": variables or {}},
         timeout=30,
     )
-    return r.json()
+    try:
+        return r.json()
+    except Exception:
+        return {"errors": [{"message": f"HTTP {r.status_code}: {r.text[:120]}"}]}
 
 
-def unwrap_name(t):
-    while t:
-        if t.get("name"):
-            return t["name"]
+def unwrap_kind_name(t):
+    while t and t.get("kind") in ("NON_NULL", "LIST"):
         t = t.get("of_type")
-    return None
+    return (t or {}).get("name")
 
 
 def render_type(t):
@@ -76,80 +77,99 @@ def render_type(t):
     return t.get("name") or k or "?"
 
 
-# ---- 1. Introspect candidate "pending invite" queries ----
-INTRO = """
+# Light: just the query_type field defs (no `types` dump — that's what crashed)
+Q_FIELDS = """
 query {
   __schema {
-    query_type { fields { name args { name type { kind name of_type { kind name of_type { kind name } } } }
-                          type { kind name of_type { kind name of_type { kind name } } } } }
-    types { name fields { name type { kind name of_type { kind name of_type { kind name } } } } }
+    query_type {
+      fields {
+        name
+        args { name type { kind name of_type { kind name of_type { kind name } } } }
+        type { kind name of_type { kind name of_type { kind name } } }
+      }
+    }
   }
 }
 """
-intro = gql("x", INTRO, {})
-if intro.get("errors"):
-    print("introspection errors:", json.dumps(intro["errors"], indent=2))
-else:
-    schema = intro["data"]["__schema"]
-    qf = {f["name"]: f for f in schema["query_type"]["fields"]}
-    types_by_name = {t["name"]: t for t in schema["types"] if t.get("name")}
-    print("=== Candidate invite/request queries ===\n")
-    for name in ["get_dm_by_members", "requests", "inbound_requests", "outbound_requests"]:
-        f = qf.get(name)
-        if not f:
-            print(f"  {name}: NOT FOUND\n")
-            continue
-        args = ", ".join(f"{a['name']}: {render_type(a['type'])}" for a in f["args"])
-        rtn = unwrap_name(f["type"])
-        print(f"  {name}({args}) -> {rtn}")
-        t = types_by_name.get(rtn)
-        if t and t.get("fields"):
-            for fld in t["fields"]:
-                print(f"       {fld['name']}: {render_type(fld['type'])}")
-        print()
+res = gql("qf", Q_FIELDS)
+if res.get("errors"):
+    print("query_type introspection failed:", res["errors"][:1])
+    raise SystemExit(1)
+qf = {f["name"]: f for f in res["data"]["__schema"]["query_type"]["fields"]}
 
-# ---- 2. Probe get_dm_by_members for every league member ----
-print("=== Per-member DM probe (finds hidden/pending DMs) ===\n")
-rosters = requests.get(f"{REST}/league/{LEAGUE_ID}/rosters", timeout=20).json() or []
-users = requests.get(f"{REST}/league/{LEAGUE_ID}/users", timeout=20).json() or []
-name_by_id = {str(u["user_id"]): u.get("display_name") for u in users}
-owner_ids = [str(r["owner_id"]) for r in rosters if r.get("owner_id")]
 
-PROBE = """
-query get_dm_by_members($members: [Snowflake]) {
-  get_dm_by_members(members: $members) {
-    dm_id dm_type last_message_id last_read_id last_author_id last_message_text
-  }
-}
-"""
-MEMBERS_Q = """
-query dm_members($dm_id: Snowflake!) {
-  dm_members(dm_id: $dm_id) { user_id display_name pending }
-}
-"""
+def type_scalar_fields(type_name):
+    """Return (all_field_render, scalar_field_names) for an object type."""
+    q = """
+    query t($n: String!) {
+      __type(name: $n) {
+        name kind
+        fields { name type { kind name of_type { kind name of_type { kind name } } } }
+      }
+    }
+    """
+    r = gql("t", q, {"n": type_name})
+    t = (r.get("data") or {}).get("__type")
+    if not t or not t.get("fields"):
+        return [], []
+    rendered, scalars = [], []
+    for f in t["fields"]:
+        rendered.append(f"{f['name']}: {render_type(f['type'])}")
+        tt = f["type"]
+        while tt and tt.get("kind") in ("NON_NULL", "LIST"):
+            tt = tt.get("of_type")
+        if tt and tt.get("kind") in ("SCALAR", "ENUM"):
+            scalars.append(f["name"])
+    return rendered, scalars
 
-for oid in owner_ids:
-    if oid == MY_ID:
+
+for name in CANDIDATES:
+    print(f"\n{'='*60}\n{name}\n{'='*60}")
+    f = qf.get(name)
+    if not f:
+        print("  NOT FOUND in schema")
         continue
-    nm = name_by_id.get(oid, oid)
-    try:
-        data = gql("get_dm_by_members", PROBE, {"members": [MY_ID, oid]})
-        if data.get("errors"):
-            print(f"  {nm} ({oid}): error {data['errors'][0].get('message')}")
-            continue
-        dm = (data.get("data") or {}).get("get_dm_by_members")
-        if not dm:
-            print(f"  {nm} ({oid}): no DM")
-            continue
-        dm_id = dm.get("dm_id")
-        unread = str(dm.get("last_message_id") or "") != str(dm.get("last_read_id") or "")
-        # check my pending status
-        pend = None
-        md = gql("dm_members", MEMBERS_Q, {"dm_id": str(dm_id)})
-        for m in ((md.get("data") or {}).get("dm_members") or []):
-            if str(m.get("user_id")) == MY_ID:
-                pend = m.get("pending")
-        print(f"  {nm}: dm_id={dm_id} pending={pend} unread={unread} "
-              f"last=\"{(dm.get('last_message_text') or '')[:45]}\"")
-    except Exception as e:
-        print(f"  {nm} ({oid}): exception {e}")
+    args_meta = f["args"]
+    args_str = ", ".join(f"{a['name']}: {render_type(a['type'])}" for a in args_meta)
+    rtn = unwrap_kind_name(f["type"])
+    print(f"  signature: {name}({args_str}) -> {rtn}")
+
+    rendered, scalars = type_scalar_fields(rtn) if rtn else ([], [])
+    if rendered:
+        print(f"  {rtn} fields: {', '.join(rendered)}")
+
+    # Build + run a real call
+    var_defs, call_args, variables = [], [], {}
+    blocked = None
+    for a in args_meta:
+        an, at = a["name"], render_type(a["type"])
+        if "user_id" in an:
+            var_defs.append(f"${an}: {at.rstrip('!')}")
+            call_args.append(f"{an}: ${an}")
+            variables[an] = MY_ID
+        elif an == "limit":
+            var_defs.append(f"${an}: {at.rstrip('!')}")
+            call_args.append(f"{an}: ${an}")
+            variables[an] = 50
+        elif an == "term":
+            var_defs.append(f"${an}: {at.rstrip('!')}")
+            call_args.append(f"{an}: ${an}")
+            variables[an] = ""
+        elif at.endswith("!"):
+            blocked = f"{an}:{at}"
+    if blocked:
+        print(f"  (skipping call — needs required arg {blocked})")
+        continue
+
+    sel = " ".join(scalars[:12]) if scalars else ""
+    vd = ("(" + ", ".join(var_defs) + ")") if var_defs else ""
+    ca = ("(" + ", ".join(call_args) + ")") if call_args else ""
+    sel_block = (" { " + sel + " }") if sel else ""
+    call_q = f"query {name}{vd} {{ {name}{ca}{sel_block} }}"
+    r = gql(name, call_q, variables)
+    if r.get("errors"):
+        print(f"  CALL error: {r['errors'][0].get('message')}")
+    else:
+        payload = (r.get("data") or {}).get(name)
+        txt = json.dumps(payload, indent=2)
+        print(f"  CALL result: {txt[:1200]}")
