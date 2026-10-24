@@ -19,6 +19,8 @@ on:
           - manage
           - scout
           - introspect
+          - dm
+          - dm-preview
 
 jobs:
   run-bot:
