@@ -197,19 +197,29 @@ def _handle_trades(read, write, roster, all_players, user_id, week, preview=Fals
 
     Returns the set of proposer user_ids handled, so the banter loop can skip them.
     """
-    txns = read.transactions(SLEEPER_LEAGUE_ID, week)
     rosters = read.rosters(SLEEPER_LEAGUE_ID)
     roster_by_id = {r["roster_id"]: r for r in rosters}
     name_by_uid = {str(u.get("user_id")): u.get("display_name")
                    for u in read.league_users(SLEEPER_LEAGUE_ID)}
 
-    pending = [t for t in txns
-               if t.get("type") == "trade" and t.get("status") == "pending"]
-    incoming = [t for t in pending if roster["roster_id"] in (t.get("roster_ids") or [])
-                and t.get("creator") != user_id]
-
     handled = set()
+
+    # Open trade offers are NOT in the public REST API (completed-only) — they
+    # live behind the authenticated GraphQL endpoint, with status "proposed".
+    try:
+        trades = write.get_trades(roster_id=roster["roster_id"])
+    except Exception as e:
+        notify(f"Trades: couldn't fetch open offers: {e}")
+        return handled
+
+    OPEN = {"proposed", "pending"}
+    incoming = [t for t in trades
+                if t.get("status") in OPEN
+                and roster["roster_id"] in (t.get("roster_ids") or [])
+                and str(t.get("creator")) != str(user_id)]
+
     if not incoming:
+        notify("🧠 Trades: no open offers to act on.")
         return handled
 
     now = time.time()
