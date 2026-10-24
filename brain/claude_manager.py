@@ -206,20 +206,33 @@ def scout_reply(context: dict) -> str:
 
 # ---------- TRADES ----------
 def evaluate_trade(context: dict) -> dict:
-    """context: {incoming_trade, my_roster, their_roster}
-    Returns {"accept": bool, "reason": ..., "analysis": ..., "counter": {...} | null}"""
+    """context: {incoming_trade, my_roster, their_roster, their_name, dm_history}
+    Returns {decision: accept|negotiate|reject, analysis, reason, dm_message}."""
     prompt = (
-        "Someone proposed a trade to me. Decide whether to accept it based on "
-        "the value I give up vs. receive under my league's scoring and my "
-        "roster needs. Think about who the real difference-makers are in each "
-        "package, schedule and injury risk, and whether this fills a positional "
-        "hole. If it's close or slightly unfavorable but fixable, suggest a counter.\n\n"
+        "Someone proposed a trade to me. Decide one of THREE outcomes based on "
+        "value under my league's scoring and my roster needs:\n"
+        "  - ACCEPT: the trade clearly helps me as-is. Take it.\n"
+        "  - NEGOTIATE: I genuinely want a player they're offering (or one on "
+        "their roster), but the current terms aren't good enough. Keep it open "
+        "and push for better terms.\n"
+        "  - REJECT: bad deal and I have no real interest in their players. Pass.\n\n"
+        "Weigh who the true difference-makers are, turnovers, steals/blocks (2x), "
+        "double-doubles, schedule and injury risk, and positional fit. Don't "
+        "accept a wash.\n\n"
         f"The proposed trade:\n{json.dumps(context.get('incoming_trade', {}), indent=2)}\n\n"
         f"My roster:\n{json.dumps(context.get('my_roster', []), indent=2)}\n\n"
         f"Their roster:\n{json.dumps(context.get('their_roster', []), indent=2)}\n\n"
-        'Respond as JSON: {"accept": true/false, '
-        '"analysis": "<3-5 sentences weighing value given up vs. received>", '
-        '"reason": "<1 sentence summary for notification>", '
-        '"counter": {"send": ["<player_id>"], "receive": ["<player_id>"]} or null}'
+        f"Who I'm dealing with: {context.get('their_name', 'a leaguemate')}\n"
+        f"Our recent DM history (oldest first), if any:\n{context.get('dm_history', '(none)')}\n\n"
+        "Also write dm_message: the actual message to send them, IN CHARACTER as a "
+        "terse, cocky, old-school talent-scout GM. 1-2 sentences MAX, usually one. "
+        "ACCEPT -> a curt confirmation. NEGOTIATE -> state plainly what would make "
+        "the deal work (which player or pick to add), no hand-holding. REJECT -> a "
+        "snarky, dismissive brush-off that insults the OFFER, not the person. No "
+        "emoji unless mocking. Don't restate full rosters.\n\n"
+        'Respond as JSON: {"decision": "accept"|"negotiate"|"reject", '
+        '"analysis": "<3-5 sentences weighing the value>", '
+        '"reason": "<1 sentence summary for the log>", '
+        '"dm_message": "<the in-character message to send them>"}'
     )
     return _ask(prompt)
