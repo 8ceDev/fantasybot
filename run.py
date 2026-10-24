@@ -1,11 +1,13 @@
 """Single entry point. Usage:
 
-    python run.py scout     # print league/roster snapshot (no Claude needed)
-    python run.py draft     # live draft assistant (run on draft night)
-    python run.py lineup    # set today's optimal lineup
-    python run.py manage    # process waivers + respond to trades
+    python run.py scout       # print league/roster snapshot (no Claude needed)
+    python run.py draft       # live draft assistant (run on draft night)
+    python run.py lineup      # set today's optimal lineup
+    python run.py manage      # process waivers + respond to trades
+    python run.py dm          # read DMs and reply in-character (sends!)
+    python run.py dm-preview  # read DMs and DRAFT replies, but send nothing
 
-The 'lineup' and 'manage' commands are what Render runs on a schedule.
+The 'lineup', 'manage', and 'dm' commands are what the scheduler runs.
 """
 
 import sys
@@ -55,6 +57,14 @@ def main():
         config.validate(require_claude=True)
         from autopilot.weekly_runner import manage_team
         manage_team()
+    elif cmd == "dm":
+        config.validate(require_claude=True)
+        from autopilot.dm_handler import handle_dms
+        handle_dms(preview=False)
+    elif cmd == "dm-preview":
+        config.validate(require_claude=True)
+        from autopilot.dm_handler import handle_dms
+        handle_dms(preview=True)
     else:
         print(f"Unknown command: {cmd}")
         print(__doc__)
