@@ -195,7 +195,10 @@ def _handle_trades(read, write, roster, all_players, user_id, week, preview=Fals
                   it's our turn, so we don't nag the same offer every run).
                   If it's dragged past NEGOTIATION_MAX_DAYS, close it as stale.
 
-    Returns the set of proposer user_ids handled, so the banter loop can skip them.
+    Returns (resolved, negotiate_map):
+      resolved      -> proposer user_ids we accepted/rejected (banter skips them)
+      negotiate_map -> {proposer_user_id: incoming_trade} left open for the DM
+                       negotiation path to carry (and possibly close with a counter).
     """
     rosters = read.rosters(SLEEPER_LEAGUE_ID)
     roster_by_id = {r["roster_id"]: r for r in rosters}
@@ -203,6 +206,7 @@ def _handle_trades(read, write, roster, all_players, user_id, week, preview=Fals
                    for u in read.league_users(SLEEPER_LEAGUE_ID)}
 
     handled = set()
+    negotiate_map = {}
 
     # Open trade offers are NOT in the public REST API (completed-only) — they
     # live behind the authenticated GraphQL endpoint, with status "proposed".
@@ -210,7 +214,7 @@ def _handle_trades(read, write, roster, all_players, user_id, week, preview=Fals
         trades = write.get_trades(roster_id=roster["roster_id"])
     except Exception as e:
         notify(f"Trades: couldn't fetch open offers: {e}")
-        return handled
+        return handled, negotiate_map
 
     OPEN = {"proposed", "pending"}
     incoming = [t for t in trades
@@ -220,7 +224,7 @@ def _handle_trades(read, write, roster, all_players, user_id, week, preview=Fals
 
     if not incoming:
         notify("🧠 Trades: no open offers to act on.")
-        return handled
+        return handled, negotiate_map
 
     now = time.time()
     for t in incoming:
@@ -229,8 +233,6 @@ def _handle_trades(read, write, roster, all_players, user_id, week, preview=Fals
         other_ids = [rid for rid in (t.get("roster_ids") or []) if rid != roster["roster_id"]]
         their_roster = roster_by_id.get(other_ids[0], {}) if other_ids else {}
         proposer_uid = str(their_roster.get("owner_id") or "")
-        if proposer_uid:
-            handled.add(proposer_uid)
         proposer_name = name_by_uid.get(proposer_uid, "a leaguemate")
 
         incoming_desc = {
@@ -279,29 +281,39 @@ def _handle_trades(read, write, roster, all_players, user_id, week, preview=Fals
             rec["reason"] = (rec.get("reason", "") + " [stale — closing it out]").strip()
             dm_message = dm_message or "This has sat too long with no movement. I'm out."
 
-        # During a live negotiation, only message when they spoke last (anti-spam).
-        our_turn = (not dm) or (str(dm.get("last_author_id")) != str(user_id))
-        send_dm = bool(dm) and bool(dm_message) and (decision in ("accept", "reject") or our_turn)
-
         notify(f"🧠 Trade {tx_id} from {proposer_name}: {decision.upper()} — {rec.get('reason','')}")
+
+        # NEGOTIATE -> leave the formal offer pending and hand the conversation
+        # (and any counter-proposal) to the DM negotiation path.
+        if decision == "negotiate":
+            if proposer_uid:
+                negotiate_map[proposer_uid] = t
+            if preview:
+                notify("    ↪ negotiate — handed to the DM negotiation path")
+            continue
+
+        # ACCEPT / REJECT are terminal — handle them here, once.
+        if proposer_uid:
+            handled.add(proposer_uid)
 
         if preview:
             if dm_message:
                 reach = "" if dm else "  (no reachable DM — would skip send)"
-                notify(f"    💬 WOULD DM: {dm_message}{reach}")
+                notify(f"    💬 WOULD {decision.upper()} + DM: {dm_message}{reach}")
             continue
 
         if decision == "accept":
             write.respond_to_trade(transaction_id=tx_id, leg=leg, accept=True)
         elif decision == "reject":
             write.respond_to_trade(transaction_id=tx_id, leg=leg, accept=False)
-        # negotiate -> leave the trade pending (no formal action)
 
-        if send_dm:
+        if dm and dm_message:
             try:
                 write.send_dm_message(dm["dm_id"], dm_message)
                 notify(f"    💬 DM'd {proposer_name}: {dm_message}")
             except Exception as e:
                 notify(f"    ✗ couldn't DM {proposer_name}: {e}")
+
+    return handled, negotiate_map
 
     return handled
