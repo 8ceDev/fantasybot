@@ -17,6 +17,7 @@ from config import (SLEEPER_LEAGUE_ID, SLEEPER_USERNAME, SLEEPER_SPORT,
                     SLEEPER_SEASON, SLEEPER_TOKEN, ENABLE_WRITES)
 from sleeper.read_client import SleeperRead
 from sleeper.write_client import SleeperWrite
+from autopilot.weekly_runner import _handle_trades
 from brain import claude_manager
 from brain.notify import notify
 
@@ -72,6 +73,17 @@ def handle_dms(preview: bool = False):
     my_roster = roster_by_owner.get(my_user_id, {})
     my_roster_names = [_pname(all_players, pid) for pid in (my_roster.get("players") or [])]
 
+    # 1) Trades first — accept / negotiate / reject (with their own DMs). This
+    #    returns the proposers it handled so we don't double-message them below.
+    week = (read.state() or {}).get("week", 1)
+    try:
+        trade_proposers = _handle_trades(read, write, my_roster, all_players,
+                                         my_user_id, week, preview=preview)
+    except Exception as e:
+        notify(f"DM bot: trade pass errored: {e}")
+        trade_proposers = set()
+
+    # 2) Banter — reply to everyone else who messaged last.
     replied = 0
     for dm in dms:
         dm_id = str(dm.get("dm_id"))
@@ -91,6 +103,12 @@ def handle_dms(preview: bool = False):
         pending = me_member.get("pending") if me_member else None
         other_name = (others[0].get("display_name") if others
                       else dm.get("last_author_display_name") or "someone")
+        other_id = str(others[0]["user_id"]) if others else None
+
+        # Skip threads the trade handler already owns (active trade with them)
+        if other_id and other_id in trade_proposers:
+            notify(f"  • {other_name}: has an active trade — handled by trade pass.")
+            continue
 
         who_last = "me" if last_author == my_user_id else other_name
         notify(f"  • {other_name}: last_from={who_last}, unread={unread}, "
@@ -101,7 +119,6 @@ def handle_dms(preview: bool = False):
             continue
 
         # Their roster (if they're a league member) for trade context
-        other_id = str(others[0]["user_id"]) if others else None
         their_roster = roster_by_owner.get(other_id, {})
         their_names = [_pname(all_players, pid) for pid in (their_roster.get("players") or [])]
 
