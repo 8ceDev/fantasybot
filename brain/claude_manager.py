@@ -288,3 +288,52 @@ def evaluate_trade(context: dict) -> dict:
         '"dm_message": "<the in-character message to send them>"}'
     )
     return _ask(prompt)
+
+
+# ---------- NEGOTIATION + PROPOSING ----------
+NEGOTIATE_SYSTEM = SCOUT_SYSTEM + """
+
+You can also CLOSE a deal. When the other party has clearly agreed, in words, to
+specific terms you're happy with (e.g. "yeah I'd do that", "deal", "ok send it"),
+stop talking and send the trade: set propose=true and list the EXACT player_ids —
+send_player_ids are players FROM MY roster that I give up, receive_player_ids are
+players FROM THEIR roster that I get. Use only player_ids that appear in the
+rosters you're given; never invent one. Only propose terms that are clearly good
+for ME. If no clear agreement on concrete terms yet, keep propose=false and just
+reply. If I already have a formal offer from them still open and these new terms
+replace it, set reject_incoming=true."""
+
+
+def negotiate(context: dict) -> dict:
+    """Drive a trade DM. Returns a reply, and — when the other side has agreed to
+    concrete terms — a structured proposal to fire off.
+
+    context: {my_roster (name+player_id+pos), their_roster, dm_history,
+              their_name, incoming_trade}
+    Returns {message, propose(bool), send_player_ids, receive_player_ids,
+             reject_incoming(bool), analysis}."""
+    prompt = (
+        f"MY roster (player_id matters):\n{json.dumps(context.get('my_roster', []), indent=2)}\n\n"
+        f"THEIR roster:\n{json.dumps(context.get('their_roster', []), indent=2)}\n\n"
+        f"Who I'm dealing with: {context.get('their_name', 'a leaguemate')}\n"
+        f"Their still-open formal offer to me (if any):\n"
+        f"{json.dumps(context.get('incoming_trade') or {}, indent=2)}\n\n"
+        f"Our DM conversation (oldest first):\n{context.get('dm_history', '(none)')}\n\n"
+        "Decide your next move. If they've clearly agreed to concrete terms good "
+        "for me, CLOSE IT (propose=true with exact player_ids). Otherwise keep "
+        "negotiating (propose=false).\n\n"
+        'Respond as JSON: {"message": "<terse in-character DM to send>", '
+        '"propose": true/false, '
+        '"send_player_ids": ["<player_id from MY roster I give up>"], '
+        '"receive_player_ids": ["<player_id from THEIR roster I get>"], '
+        '"reject_incoming": true/false, '
+        '"analysis": "<2-3 sentences: what was agreed and why these terms>"}'
+    )
+    return _ask_persona(NEGOTIATE_SYSTEM, prompt)
+
+
+def _ask_persona(system: str, user_prompt: str, max_tokens: int = 2000) -> dict:
+    """Like _ask but with a custom (persona) system prompt."""
+    resp = _create(system, user_prompt, max_tokens)
+    text = "\n".join(_text_blocks(resp)).strip()
+    return _parse_json(text)
