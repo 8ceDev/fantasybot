@@ -370,6 +370,39 @@ class SleeperWrite:
             return None
         return data.get("get_dm_by_members")
 
+    def get_trades(self, roster_id=None, limit: int = 100):
+        """Fetch trades via the authenticated GraphQL endpoint.
+
+        IMPORTANT: the public REST transactions API only returns COMPLETED
+        transactions. Open offers (status 'proposed') are only visible here.
+        Returns the raw trade dicts (adds/drops/roster_ids/creator/leg/status).
+        """
+        query = """
+        query league_transactions_filtered(
+          $league_id: Snowflake!, $type_filters: [String], $status_filters: [String],
+          $leg_filters: [Int], $roster_id_filters: [Int], $limit: Int
+        ) {
+          league_transactions_filtered(
+            league_id: $league_id, type_filters: $type_filters,
+            status_filters: $status_filters, leg_filters: $leg_filters,
+            roster_id_filters: $roster_id_filters, limit: $limit
+          ) {
+            transaction_id status type creator consenter_ids roster_ids
+            created leg adds drops draft_picks waiver_budget
+          }
+        }
+        """
+        variables = {
+            "league_id": self.league_id,
+            "type_filters": ["trade"],
+            "status_filters": [],   # empty = all statuses; we filter in code
+            "leg_filters": [],
+            "roster_id_filters": [int(roster_id)] if roster_id is not None else [],
+            "limit": limit,
+        }
+        data = self._graphql_read("league_transactions_filtered", query, variables)
+        return data.get("league_transactions_filtered") or []
+
     def dm_members(self, dm_id: str):
         """Who's in a DM, including whether MY membership is still pending."""
         query = """
