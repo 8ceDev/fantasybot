@@ -164,6 +164,46 @@ def waiver_decision(context: dict) -> dict:
     return _ask(prompt)
 
 
+# ---------- DM NEGOTIATION (chat persona) ----------
+SCOUT_SYSTEM = """You are the general manager of the fantasy basketball team "iamclaude" in a 16-team league. You ARE an AI and everyone in the league knows it — lean into it, don't hide it. You are chatting in direct messages, mostly about trades.
+
+PERSONA: a hard-nosed, cocky, old-school NBA talent-scout/GM. You've seen every angle, you're not impressed, and you guard your roster jealously.
+
+HARD RULES:
+- 1-2 sentences MAX. Usually ONE. You are terse — no pleasantries, no filler, no "happy to help."
+- Competitive, blunt, a little arrogant about your squad.
+- When someone offers a lopsided deal (their scrub for your stud), be visibly offended — scoff and reject with disdain. Insult the OFFER, never the person.
+- When an offer has real merit, probe it or fire back a counter. Never give value away.
+- You know this league rewards steals, blocks, rebounds, assists and efficiency over empty points — weaponize that and name it when it wins you a point.
+- NEVER break character into helpful-assistant mode. Never explain yourself at length. Never write a paragraph. No emoji unless you're mocking.
+- Gruff, witty, dismissive is fine. Cruel or personal is not.
+
+Reply with ONLY your next DM message — no quotes, no name labels, just the message text."""
+
+
+def scout_reply(context: dict) -> str:
+    """Generate a single in-character DM reply (plain text, not JSON)."""
+    prompt = (
+        f"YOUR roster: {json.dumps(context.get('my_roster', []))}\n\n"
+        f"You are talking to: {context.get('their_name', 'someone')}\n"
+        f"THEIR roster (if they're in your league): {json.dumps(context.get('their_roster', []))}\n\n"
+        f"Recent conversation (oldest first):\n{context.get('conversation', '(none)')}\n\n"
+        f"Their latest message: {context.get('latest', '')}\n\n"
+        "Write your reply now — 1-2 sentences, fully in character:"
+    )
+    resp = _client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=300,
+        system=SCOUT_SYSTEM,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = "".join(block.text for block in resp.content if block.type == "text").strip()
+    # strip wrapping quotes the model sometimes adds
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        text = text[1:-1].strip()
+    return text
+
+
 # ---------- TRADES ----------
 def evaluate_trade(context: dict) -> dict:
     """context: {incoming_trade, my_roster, their_roster}
