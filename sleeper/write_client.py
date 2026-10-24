@@ -347,6 +347,29 @@ class SleeperWrite:
         data = self._graphql_read("my_dms", query, {"limit": 50})
         return data.get("my_dms") or []
 
+    def find_dm_with(self, my_user_id: str, other_user_id: str):
+        """Return the DM thread between me and one other user, or None.
+
+        Works only for DMs I've already accepted — a still-pending invite
+        errors with 'this DM doesn't seem to exist', which we treat as None.
+        """
+        query = """
+        query get_dm_by_members($members: [Snowflake]) {
+          get_dm_by_members(members: $members) {
+            dm_id dm_type last_message_id last_read_id
+            last_author_id last_author_display_name last_message_text
+          }
+        }
+        """
+        try:
+            data = self._graphql_read(
+                "get_dm_by_members", query,
+                {"members": [str(my_user_id), str(other_user_id)]},
+            )
+        except RuntimeError:
+            return None
+        return data.get("get_dm_by_members")
+
     def dm_members(self, dm_id: str):
         """Who's in a DM, including whether MY membership is still pending."""
         query = """
