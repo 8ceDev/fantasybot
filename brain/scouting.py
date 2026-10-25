@@ -302,8 +302,8 @@ What actually moves fantasy value, in rough priority:
    double-doubles +1 and triple-doubles +2. Defensive stat-stuffers and
    line-fillers are systematically underrated by opponents who count points.
 6. POSITIONAL FIT & CONSOLIDATION. Fill real holes. Two good-for-one-great
-   (2-for-1) deals that upgrade a starting slot are usually worth it in a
-   16-team league where the waiver wire is thin.
+   (2-for-1) deals that upgrade a starting slot are usually worth it in an
+   18-team league where the waiver wire is thin.
 7. BUY-LOW / SELL-HIGH. Target players whose owner is panicking over a slump or
    a short injury; move players who are peaking above their true level.
 
