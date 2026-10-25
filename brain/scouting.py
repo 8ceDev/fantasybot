@@ -205,7 +205,7 @@ def _slot_allows(pos, slot) -> bool:
     return bool(set(pos or []) & allowed)
 
 
-def assign_lineup_slots(slots, chosen_ids, pos_by_id, fill_ids=None):
+def assign_lineup_slots(slots, chosen_ids, pos_by_id, fill_ids=None, locked=None):
     """Seat players into positional starting slots so every seat is legal.
 
     slots       -> ordered slot codes, e.g. ["PG","SG","G","SF","PF","F","C","UTIL","UTIL"]
@@ -213,6 +213,11 @@ def assign_lineup_slots(slots, chosen_ids, pos_by_id, fill_ids=None):
     pos_by_id   -> {player_id: [eligible positions]}
     fill_ids    -> extra rostered players (best-first) used ONLY to fill slots
                    the chosen set leaves empty, so we never submit a hole.
+    locked      -> {slot_index: player_id} for players already LOCKED into a
+                   slot (their game has started this matchup period). Sleeper
+                   rejects any write that MOVES a locked player, so these slots
+                   are pinned: never filled by anyone else, never bumped, and
+                   the pinned player is kept exactly where Sleeper has them.
 
     Returns (starters, seated, benched, holes):
       starters -> list the length of `slots`; starters[i] is the player for
@@ -227,11 +232,18 @@ def assign_lineup_slots(slots, chosen_ids, pos_by_id, fill_ids=None):
     priority order, so higher-priority picks always keep a seat.
     """
     n = len(slots)
+    locked = {int(i): str(p) for i, p in (locked or {}).items()}
+    locked_slots = set(locked)
+    locked_pids = set(locked.values())
     slot_of = [None] * n          # slot index -> player_id
+    for si, pid in locked.items():
+        slot_of[si] = pid
 
     def augment(pid, visited):
         for si in range(n):
-            if si in visited or not _slot_allows(pos_by_id.get(pid), slots[si]):
+            # never place into or bump a locked slot
+            if (si in visited or si in locked_slots
+                    or not _slot_allows(pos_by_id.get(pid), slots[si])):
                 continue
             visited.add(si)
             if slot_of[si] is None or augment(slot_of[si], visited):
@@ -242,15 +254,15 @@ def assign_lineup_slots(slots, chosen_ids, pos_by_id, fill_ids=None):
     seated, benched = [], []
     for pid in chosen_ids:
         pid = str(pid)
-        if not pid or pid == "0":
+        if not pid or pid == "0" or pid in locked_pids:
             continue
         (seated if augment(pid, set()) else benched).append(pid)
 
-    # Backfill any still-empty slots with the best remaining rostered players,
-    # so a dropped starter never leaves a zero-scoring hole.
+    # Backfill any still-empty (non-locked) slots with the best remaining
+    # rostered players, so a dropped starter never leaves a zero-scoring hole.
     placed = set(p for p in slot_of if p is not None)
     for pid in (fill_ids or []):
-        if None not in slot_of:
+        if all(slot_of[i] is not None for i in range(n)):
             break
         pid = str(pid)
         if not pid or pid == "0" or pid in placed:
