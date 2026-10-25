@@ -100,11 +100,34 @@ def set_lineup():
     fill_ids = [c["player_id"] for c in candidates          # candidates are best-first
                 if c["player_id"] not in chosen_set and c.get("status") not in unavailable]
 
+    # Debug: log the raw inputs so we can diagnose mismatches between our
+    # eligibility map and what Sleeper actually enforces.
+    notify(f"   [debug] starting_slots={starting_slots}")
+    for pid in chosen:
+        notify(f"   [debug] {_name(all_players, pid)} ({pid}): "
+               f"fantasy_positions={pos_by_id.get(pid)}")
+
     starters, seated, benched, holes = assign_lineup_slots(
         starting_slots, chosen, pos_by_id, fill_ids=fill_ids)
 
+    # Safety: verify every seated player is eligible for their slot BEFORE
+    # submitting, using the STRICTEST interpretation — player's primary
+    # position only — as a fallback when our wider eligibility map doesn't
+    # match Sleeper's actual enforcement.
+    for i, pid in enumerate(starters):
+        if pid == "0":
+            continue
+        slot = starting_slots[i]
+        pos = pos_by_id.get(pid)
+        from brain.scouting import _slot_allows
+        if not _slot_allows(pos, slot):
+            notify(f"   ✗ PRE-SUBMIT CHECK FAILED: {_name(all_players, pid)} ({pid}) "
+                   f"pos={pos} can't fill slot {slot} — aborting lineup write")
+            return
+
     pretty = ", ".join(_name(all_players, pid) for pid in starters if pid != "0")
     notify(f"🧠 Lineup decision: {pretty}\n   {rec.get('reason','')}")
+    notify(f"   [debug] starters={starters}")
     if benched:
         notify("   ⚠ couldn't legally seat (no open slot their position fills): "
                + ", ".join(_name(all_players, p) for p in benched))
