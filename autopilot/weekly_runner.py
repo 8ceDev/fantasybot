@@ -89,10 +89,6 @@ def set_lineup():
         notify(f"Lineup: couldn't parse brain output.\n{rec.get('_raw','')[:400]}")
         return
 
-    # The brain decides WHO starts; the code decides WHERE each one sits. Sleeper
-    # rejects the entire lineup if any player is in a slot their position can't
-    # fill, so we re-slot from scratch here — placing the brain's picks into legal
-    # slots and backfilling any empty slot with the best eligible bench player.
     chosen = [str(p) for p in rec.get("starters", [])]
     pos_by_id = {c["player_id"]: c.get("pos") for c in candidates}
     unavailable = {"Out", "IR", "Doubtful", "Suspension", "NA", "DNR"}
@@ -100,14 +96,50 @@ def set_lineup():
     fill_ids = [c["player_id"] for c in candidates          # candidates are best-first
                 if c["player_id"] not in chosen_set and c.get("status") not in unavailable]
 
-    starters, seated, benched, holes = assign_lineup_slots(
-        starting_slots, chosen, pos_by_id, fill_ids=fill_ids)
+    # Find the leg we're editing. A matchup week (the `round`) holds the legs;
+    # for this league there's one leg per week (weekly lineups). state.leg is
+    # the current scoring period; use it to pick our roster's leg.
+    round_ = week
+    state_leg = state.get("leg")
+    my_legs = [l for l in write.get_matchup_legs(round_)
+               if l.get("roster_id") == roster["roster_id"]]
+    target = None
+    if state_leg is not None:
+        target = next((l for l in my_legs if l.get("leg") == state_leg), None)
+    if target is None and my_legs:
+        target = max(my_legs, key=lambda l: l.get("leg", 0))
+    target_leg = target.get("leg") if target else (state_leg if state_leg is not None else week)
 
-    # Safety: verify every seated player is eligible for their slot BEFORE we
-    # submit, so a data mismatch can never push an illegal lineup to Sleeper.
+    # LOCKED PLAYERS. In a weekly lineup a player locks into their slot the
+    # moment their game tips off, and Sleeper rejects any write that MOVES a
+    # locked player — which is why a full nightly rewrite always failed. So:
+    #   • the committed lineup for this leg is our starting point
+    #   • any current starter who has already scored this week is LOCKED and
+    #     pinned to their exact slot
+    #   • only players who haven't played yet are eligible to fill the rest
+    # At the very start of a week nothing has scored, so nothing is locked and
+    # we set the whole optimal lineup freely.
+    committed = (target or {}).get("starters")
+    if committed is None:
+        committed = read.my_roster(SLEEPER_LEAGUE_ID, user_id).get("starters") or []
+    mine = (read.my_matchup(SLEEPER_LEAGUE_ID, week, roster["roster_id"]) or {}).get("mine") or {}
+    points = mine.get("players_points") or {}
+    played = {str(pid) for pid, p in points.items() if p}   # scored => has played => locked
+
+    locked = {i: str(pid) for i, pid in enumerate(committed)
+              if pid and str(pid) != "0" and str(pid) in played}
+    # Can't move a player who's already played, so they can't be newly started.
+    chosen_free = [p for p in chosen if p not in played]
+    fill_free = [p for p in fill_ids if p not in played]
+
+    starters, seated, benched, holes = assign_lineup_slots(
+        starting_slots, chosen_free, pos_by_id, fill_ids=fill_free, locked=locked)
+
+    # Safety: verify every NON-locked seat is position-legal before we submit
+    # (locked seats are Sleeper's own and are left exactly as-is).
     from brain.scouting import _slot_allows
     for i, pid in enumerate(starters):
-        if pid == "0":
+        if pid == "0" or i in locked:
             continue
         if not _slot_allows(pos_by_id.get(pid), starting_slots[i]):
             notify(f"   ✗ pre-submit check failed: {_name(all_players, pid)} ({pid}) "
@@ -117,66 +149,24 @@ def set_lineup():
 
     pretty = ", ".join(_name(all_players, pid) for pid in starters if pid != "0")
     notify(f"🧠 Lineup decision: {pretty}\n   {rec.get('reason','')}")
+    if locked:
+        notify(f"   🔒 {len(locked)} slot(s) locked (already played this week) — kept as-is: "
+               + ", ".join(_name(all_players, locked[i]) for i in sorted(locked)))
     if benched:
-        notify("   ⚠ couldn't legally seat (no open slot their position fills): "
+        notify("   ⚠ couldn't legally seat (no open slot, or already played): "
                + ", ".join(_name(all_players, p) for p in benched))
     if holes:
-        notify("   ⚠ empty slot(s) with no eligible player: " + ", ".join(holes))
+        notify("   ⚠ empty slot(s) with no eligible available player: " + ", ".join(holes))
 
-    # NBA uses DAILY lineups: a matchup week (the `round`) holds one leg per
-    # scoring day, and each day's leg is edited separately. We were writing to
-    # leg == week, a locked past day → "the move you are trying to make is
-    # illegal". Discover TODAY's leg from Sleeper instead of hardcoding it:
-    # matchup_legs(round=week) returns our roster's legs; state.leg is the
-    # current global day counter that identifies which one is today.
-    round_ = week
-    state_leg = state.get("leg")
-    my_legs = [l for l in write.get_matchup_legs(round_)
-               if l.get("roster_id") == roster["roster_id"]]
-    target = None
-    if state_leg is not None:
-        target = next((l for l in my_legs if l.get("leg") == state_leg), None)
-    if target is None and my_legs:
-        target = max(my_legs, key=lambda l: l.get("leg", 0))   # latest day
-    target_leg = target.get("leg") if target else (state_leg if state_leg is not None else week)
-    notify(f"   [debug] round(week)={round_} state.leg={state_leg} "
-           f"legs_seen={sorted(l.get('leg') for l in my_legs)} → writing leg={target_leg}")
+    if committed == starters:
+        notify("   Lineup already matches — nothing to submit.")
+        return
 
-    # ---- DIAGNOSTIC ONLY (no write this run) ----
-    # Positions are legal and the leg is correct, yet Sleeper still rejects the
-    # write. The likely rule: in a weekly lineup, a player locks into their slot
-    # once their game starts, and a write that MOVES a locked player is illegal.
-    # Print the current committed lineup + who has already scored (= played =
-    # locked) so we can see exactly which rule we're hitting, then stop.
-    current = target.get("starters") if target else None
-    if current is None:
-        current = read.my_roster(SLEEPER_LEAGUE_ID, user_id).get("starters")
-    mu = read.my_matchup(SLEEPER_LEAGUE_ID, week, roster["roster_id"]) or {}
-    mine = mu.get("mine") or {}
-    pts = mine.get("players_points") or {}
-
-    notify(f"   [diag] committed starters (leg): {current}")
-    notify(f"   [diag] matchup starters:        {mine.get('starters')}")
-    notify(f"   [diag] proposed starters:       {starters}")
-    # Slot-by-slot: is any CURRENT starter that has already scored being moved?
-    moved_locked = []
-    for i, slot in enumerate(starting_slots):
-        cur_pid = current[i] if current and i < len(current) else None
-        new_pid = starters[i] if i < len(starters) else None
-        cur_pts = pts.get(cur_pid, 0) if cur_pid else 0
-        flag = ""
-        if cur_pid and cur_pid != "0" and cur_pts and cur_pid != new_pid:
-            flag = "  ← LOCKED starter being moved (illegal!)"
-            moved_locked.append(cur_pid)
-        notify(f"   [diag] {slot:4} now={_name(all_players, cur_pid)}({cur_pts}pts) "
-               f"→ proposed={_name(all_players, new_pid)}{flag}")
-    if moved_locked:
-        notify("   [diag] VERDICT: locked players are being moved — that's the illegal move.")
-    else:
-        notify("   [diag] VERDICT: no locked starter is being moved — cause is elsewhere "
-               "(likely the starters_games map). ")
-    notify("   [diag] No lineup written this run (diagnostic). Set it by hand in the app for now.")
-    return
+    write.set_lineup(roster_id=roster["roster_id"],
+                     starters=starters,
+                     leg=target_leg,
+                     round_=round_,
+                     reserve=rec.get("reserve", []))
 
 
 # ---------------- WAIVERS + TRADES ----------------
