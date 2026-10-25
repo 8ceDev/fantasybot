@@ -182,6 +182,87 @@ class Scout:
         return ctx
 
 
+# ---------- lineup slotting ----------
+# Sleeper rejects a whole lineup with "the move you are trying to make is
+# illegal" the moment ONE player sits in a slot their position can't fill (a
+# guard in a forward slot, a center in a G slot, ...). The brain decides WHO
+# starts; this decides WHERE each one sits, so the array we submit is always
+# positionally legal. Separating the two means a dual-guard can never get
+# stranded in a forward slot and kill the entire lineup write again.
+SLOT_ELIGIBILITY = {
+    "PG": {"PG"}, "SG": {"SG"}, "SF": {"SF"}, "PF": {"PF"}, "C": {"C"},
+    "G": {"PG", "SG"}, "F": {"SF", "PF"},
+    "GF": {"PG", "SG", "SF", "PF"}, "WING": {"SG", "SF"},
+    "FC": {"SF", "PF", "C"},
+    "UTIL": None,   # anyone
+}
+
+
+def _slot_allows(pos, slot) -> bool:
+    allowed = SLOT_ELIGIBILITY.get(slot)
+    if allowed is None:          # UTIL, or any slot code we don't recognize -> anyone
+        return True
+    return bool(set(pos or []) & allowed)
+
+
+def assign_lineup_slots(slots, chosen_ids, pos_by_id, fill_ids=None):
+    """Seat players into positional starting slots so every seat is legal.
+
+    slots       -> ordered slot codes, e.g. ["PG","SG","G","SF","PF","F","C","UTIL","UTIL"]
+    chosen_ids  -> the players the brain wants to START, in priority order
+    pos_by_id   -> {player_id: [eligible positions]}
+    fill_ids    -> extra rostered players (best-first) used ONLY to fill slots
+                   the chosen set leaves empty, so we never submit a hole.
+
+    Returns (starters, seated, benched, holes):
+      starters -> list the length of `slots`; starters[i] is the player for
+                  slots[i], or "0" if nothing legal could fill it.
+      seated   -> chosen_ids that got a seat.
+      benched  -> chosen_ids that couldn't be seated (brain over-picked a position).
+      holes    -> slot codes left empty.
+
+    Uses augmenting-path matching (Kuhn's), so a player eligible for several
+    slots is moved around to make room for others rather than blocking them.
+    Augmenting never unseats anyone, and chosen players are processed in
+    priority order, so higher-priority picks always keep a seat.
+    """
+    n = len(slots)
+    slot_of = [None] * n          # slot index -> player_id
+
+    def augment(pid, visited):
+        for si in range(n):
+            if si in visited or not _slot_allows(pos_by_id.get(pid), slots[si]):
+                continue
+            visited.add(si)
+            if slot_of[si] is None or augment(slot_of[si], visited):
+                slot_of[si] = pid
+                return True
+        return False
+
+    seated, benched = [], []
+    for pid in chosen_ids:
+        pid = str(pid)
+        if not pid or pid == "0":
+            continue
+        (seated if augment(pid, set()) else benched).append(pid)
+
+    # Backfill any still-empty slots with the best remaining rostered players,
+    # so a dropped starter never leaves a zero-scoring hole.
+    placed = set(p for p in slot_of if p is not None)
+    for pid in (fill_ids or []):
+        if None not in slot_of:
+            break
+        pid = str(pid)
+        if not pid or pid == "0" or pid in placed:
+            continue
+        if augment(pid, set()):
+            placed.add(pid)
+
+    starters = [p if p is not None else "0" for p in slot_of]
+    holes = [slots[i] for i in range(n) if slot_of[i] is None]
+    return starters, seated, benched, holes
+
+
 # Framework the brain shares across every decision — the "how to think" layer
 # that complements the live numbers the Scout provides. Kept here so lineup,
 # waivers, trades, and the DM negotiator all reason from the same playbook.
