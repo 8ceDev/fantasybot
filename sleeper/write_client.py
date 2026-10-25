@@ -104,13 +104,18 @@ class SleeperWrite:
 
     # ---- the actual moves ----
 
-    def set_lineup(self, roster_id: int, starters: list, leg: int, reserve: list = None):
-        """Set the starting lineup for the current matchup leg.
+    def set_lineup(self, roster_id: int, starters: list, leg: int,
+                   round_: int = None, reserve: list = None):
+        """Set the starting lineup for a specific matchup leg.
 
-        For NBA fantasy, `leg` is the current NBA week (from state().week). The
-        web app inlines league_id/roster_id/leg/round/starters directly into the
-        query string — only starters_games is passed as a GraphQL variable (we
-        pass {} since we don't need to pin lineups to specific games).
+        NBA uses DAILY lineups: a matchup period (the `round`, = state.week)
+        contains one `leg` per scoring day, and each day's leg is edited
+        separately. Writing to the wrong leg — e.g. the week number, which is a
+        past/locked day — fails with "the move you are trying to make is
+        illegal". So `leg` must be the CURRENT day's leg (from matchup_legs /
+        state.leg), and `round` the matchup week. For weekly sports (NFL, EPL)
+        leg == round == week, which is why passing them equal used to "work"
+        everywhere except daily NBA.
 
         `reserve` is currently ignored — moving a player to IR is a separate
         mutation (move_to_ir) that isn't wired up yet.
@@ -118,7 +123,7 @@ class SleeperWrite:
         safe_league = _snowflake(self.league_id)
         safe_roster = int(roster_id)
         safe_leg = int(leg)
-        safe_round = int(leg)   # for NBA, round == leg == current week
+        safe_round = int(round_ if round_ is not None else leg)
         safe_starters = json.dumps(_safe_player_ids(starters))
 
         query = f"""
@@ -143,7 +148,7 @@ class SleeperWrite:
         """
         return self._graphql(
             "update_matchup_leg", query, {"starters_games": {}},
-            intent=f"set_lineup roster={roster_id} leg={leg} starters={starters}",
+            intent=f"set_lineup roster={roster_id} leg={safe_leg} round={safe_round} starters={starters}",
         )
 
     def waiver_claim(self, roster_id: int, add_player_id: str,
@@ -369,6 +374,26 @@ class SleeperWrite:
         except RuntimeError:
             return None
         return data.get("get_dm_by_members")
+
+    def get_matchup_legs(self, round_: int):
+        """Read every matchup leg in a round (matchup week).
+
+        For NBA this returns one leg per scoring DAY per roster; each leg object
+        carries its own `leg` number, `roster_id`, `round`, and current
+        `starters`. This is how we discover the correct leg to write today
+        instead of hardcoding leg == week. Best-effort: [] on any failure."""
+        query = """
+        query matchup_legs($round: Int) {
+          matchup_legs(league_id: "%s", round: $round) {
+            leg matchup_id roster_id round starters points
+          }
+        }
+        """ % _snowflake(self.league_id)
+        try:
+            data = self._graphql_read("matchup_legs", query, {"round": int(round_)})
+        except RuntimeError:
+            return []
+        return data.get("matchup_legs") or []
 
     def get_trades(self, roster_id=None, limit: int = 100):
         """Fetch trades via the authenticated GraphQL endpoint.
