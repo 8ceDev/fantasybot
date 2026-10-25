@@ -50,6 +50,32 @@ def _name(all_players, pid):
     return p.get("full_name") or pid
 
 
+def _add_player(write, roster_id, add_id, drop_id, faab):
+    """Submit an add (with optional drop), falling back to an instant free-agent
+    add when the player isn't on waivers. Returns True on success. Never raises —
+    logs the failure and returns False, so one bad add can't abort the cycle.
+
+    The waiver->free_agent fallback is a DIFFERENT mutation, not a retry of the
+    same write, so it's safe (see write_client docstring #3)."""
+    try:
+        write.waiver_claim(roster_id=roster_id, add_player_id=add_id,
+                           drop_player_id=drop_id, faab_bid=int(faab or 0))
+        return True
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if any(k in msg for k in ("waiver", "claim", "passed", "free agent")):
+            notify("   ↳ Not on waivers — adding directly as a free agent.")
+            try:
+                write.add_free_agent(roster_id=roster_id, add_player_id=add_id,
+                                     drop_player_id=drop_id)
+                return True
+            except RuntimeError as e2:
+                notify(f"   ✗ Free-agent add also failed: {e2}")
+                return False
+        notify(f"   ✗ Waiver claim failed: {e}")
+        return False
+
+
 # Enriched player cards (with real fantasy-point production) are built by the
 # Scout in brain/scouting.py — see scout.cards(). This module only needs plain
 # names for its notifications and trade descriptions.
@@ -200,7 +226,21 @@ def _handle_waivers(read, write, roster, all_players, scout=None, team_context=N
 
     roster_cards = scout.cards(roster.get("players") or [])
     faab_left = 100 - (roster.get("settings", {}).get("waiver_budget_used", 0) or 0)
-    open_slots = max(0, 14 - len(roster.get("players") or []))
+
+    # Open ACTIVE roster slots = how many players we can add WITHOUT dropping
+    # anyone. Derive the cap from the league's real roster layout (this league is
+    # NOT 14-deep) instead of a hardcoded guess, and don't count players stashed
+    # on IR/reserve against the active cap — they sit in separate slots. An empty
+    # active slot scores zero every single day, so these must never be left open.
+    league = scout.league if isinstance(scout.league, dict) else read.league(SLEEPER_LEAGUE_ID)
+    positions = (league or {}).get("roster_positions", []) or []
+    active_cap = len([p for p in positions if p not in ("IR", "RES", "TAXI")]) or 14
+    reserve_ids = set(str(p) for p in (roster.get("reserve") or []))
+    active_players = [p for p in (roster.get("players") or []) if str(p) not in reserve_ids]
+    open_slots = max(0, active_cap - len(active_players))
+    notify(f"   roster: {len(active_players)}/{active_cap} active slots filled"
+           + (f", {len(reserve_ids)} on IR" if reserve_ids else "")
+           + f" → {open_slots} open")
 
     rec = claude_manager.waiver_decision({
         "your_roster": roster_cards,
@@ -215,33 +255,43 @@ def _handle_waivers(read, write, roster, all_players, scout=None, team_context=N
         return
 
     claims = rec.get("claims", [])
+    taken = set()   # players added this run — so the backfill never re-adds one
     if not claims:
         notify(f"🧠 Waivers: no moves this cycle. {rec.get('note','')}")
-        return
     for c in claims:
+        add_id = c.get("add")
         notify(f"🧠 Waiver claim: ADD {c.get('name')} "
                f"DROP {_name(all_players, c.get('drop')) if c.get('drop') else '(open slot)'} "
                f"for ${c.get('faab')} — {c.get('reason','')}")
-        try:
-            write.waiver_claim(roster_id=roster["roster_id"],
-                               add_player_id=c.get("add"),
-                               drop_player_id=c.get("drop"),
-                               faab_bid=int(c.get("faab", 0)))
-        except RuntimeError as e:
-            msg = str(e).lower()
-            # If the player isn't on waivers (already a free agent), there's no
-            # claim to place — add them directly instead. This is a different
-            # mutation, not a retry of the same write, so it's safe.
-            if any(k in msg for k in ("waiver", "claim", "passed", "free agent")):
-                notify("   ↳ Not on waivers — adding directly as a free agent.")
-                try:
-                    write.add_free_agent(roster_id=roster["roster_id"],
-                                         add_player_id=c.get("add"),
-                                         drop_player_id=c.get("drop"))
-                except RuntimeError as e2:
-                    notify(f"   ✗ Free-agent add also failed: {e2}")
-            else:
-                notify(f"   ✗ Waiver claim failed: {e}")
+        if _add_player(write, roster["roster_id"], add_id, c.get("drop"), c.get("faab", 0)):
+            if add_id:
+                taken.add(str(add_id))
+            if not c.get("drop"):        # a no-drop add consumed one open slot
+                open_slots = max(0, open_slots - 1)
+
+    # SAFETY NET — never leave an active roster slot empty. An empty slot scores
+    # zero every day and quietly drags win odds, which is exactly what happened
+    # here. The brain may or may not choose to fill them; this guarantees it.
+    # We only ADD (never drop) into genuinely empty slots, using the best
+    # available free agents by our scoring, skipping anyone currently unavailable.
+    if open_slots > 0:
+        unavailable = {"Out", "IR", "Doubtful", "Suspension", "NA", "DNR"}
+        owned = set(str(p) for p in (roster.get("players") or [])) | taken
+        fillable = [c for c in fa_top
+                    if str(c.get("player_id")) not in owned
+                    and c.get("status") not in unavailable]
+        if fillable:
+            notify(f"🧠 {open_slots} empty roster slot(s) — filling with the best "
+                   f"available free agents (no drop, $0).")
+        for c in fillable:
+            if open_slots <= 0:
+                break
+            add_id = str(c.get("player_id"))
+            fpg = c.get("fpts_per_game") or c.get("proj_fpts_per_game") or "?"
+            notify(f"   ➕ ADD {c.get('name')} (open slot) — {fpg} fpg")
+            if _add_player(write, roster["roster_id"], add_id, None, 0):
+                owned.add(add_id)
+                open_slots -= 1
 
 
 def _handle_trades(read, write, roster, all_players, user_id, week, preview=False,
