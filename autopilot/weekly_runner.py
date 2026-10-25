@@ -142,20 +142,41 @@ def set_lineup():
     notify(f"   [debug] round(week)={round_} state.leg={state_leg} "
            f"legs_seen={sorted(l.get('leg') for l in my_legs)} → writing leg={target_leg}")
 
-    # Don't clobber an identical lineup. Prefer the leg's own current starters
-    # (authoritative for the day); fall back to the roster-level starters.
+    # ---- DIAGNOSTIC ONLY (no write this run) ----
+    # Positions are legal and the leg is correct, yet Sleeper still rejects the
+    # write. The likely rule: in a weekly lineup, a player locks into their slot
+    # once their game starts, and a write that MOVES a locked player is illegal.
+    # Print the current committed lineup + who has already scored (= played =
+    # locked) so we can see exactly which rule we're hitting, then stop.
     current = target.get("starters") if target else None
     if current is None:
         current = read.my_roster(SLEEPER_LEAGUE_ID, user_id).get("starters")
-    if current == starters:
-        notify("   Lineup already matches — nothing to submit.")
-        return
+    mu = read.my_matchup(SLEEPER_LEAGUE_ID, week, roster["roster_id"]) or {}
+    mine = mu.get("mine") or {}
+    pts = mine.get("players_points") or {}
 
-    write.set_lineup(roster_id=roster["roster_id"],
-                     starters=starters,
-                     leg=target_leg,
-                     round_=round_,
-                     reserve=rec.get("reserve", []))
+    notify(f"   [diag] committed starters (leg): {current}")
+    notify(f"   [diag] matchup starters:        {mine.get('starters')}")
+    notify(f"   [diag] proposed starters:       {starters}")
+    # Slot-by-slot: is any CURRENT starter that has already scored being moved?
+    moved_locked = []
+    for i, slot in enumerate(starting_slots):
+        cur_pid = current[i] if current and i < len(current) else None
+        new_pid = starters[i] if i < len(starters) else None
+        cur_pts = pts.get(cur_pid, 0) if cur_pid else 0
+        flag = ""
+        if cur_pid and cur_pid != "0" and cur_pts and cur_pid != new_pid:
+            flag = "  ← LOCKED starter being moved (illegal!)"
+            moved_locked.append(cur_pid)
+        notify(f"   [diag] {slot:4} now={_name(all_players, cur_pid)}({cur_pts}pts) "
+               f"→ proposed={_name(all_players, new_pid)}{flag}")
+    if moved_locked:
+        notify("   [diag] VERDICT: locked players are being moved — that's the illegal move.")
+    else:
+        notify("   [diag] VERDICT: no locked starter is being moved — cause is elsewhere "
+               "(likely the starters_games map). ")
+    notify("   [diag] No lineup written this run (diagnostic). Set it by hand in the app for now.")
+    return
 
 
 # ---------------- WAIVERS + TRADES ----------------
