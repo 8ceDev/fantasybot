@@ -1,0 +1,46 @@
+# Render blueprint. Commit this and point Render at the repo to get two
+# scheduled jobs for free-ish (cron jobs are cheap). Times are UTC.
+#
+# NOTE: the draft assistant is NOT a cron job — you run it interactively on
+# draft night (see README). These cron jobs are the in-season autopilot.
+
+services:
+  # Runs every day at 11:00 UTC (7:00am ET) — well before most NBA tip-offs —
+  # to set the day's optimal lineup from who's playing / injured.
+  - type: cron
+    name: sleeper-lineup
+    runtime: python
+    schedule: "0 11 * * *"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python run.py lineup"
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SLEEPER_TOKEN
+        sync: false
+      - key: SLEEPER_LEAGUE_ID
+        sync: false
+      - key: ENABLE_WRITES
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+
+  # Runs once a day at 10:00 UTC (6:00am ET) to process waivers and scan for
+  # trades. Waivers in this league clear daily.
+  - type: cron
+    name: sleeper-waivers-trades
+    runtime: python
+    schedule: "0 10 * * *"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python run.py manage"
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SLEEPER_TOKEN
+        sync: false
+      - key: SLEEPER_LEAGUE_ID
+        sync: false
+      - key: ENABLE_WRITES
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
+        sync: false

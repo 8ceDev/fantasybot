@@ -1,0 +1,64 @@
+name: Sleeper DM Bot
+
+on:
+  schedule:
+    # Every 20 minutes — poll DMs and reply in-character.
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'dm = send for real, dm-preview = draft only (no send)'
+        required: true
+        default: 'dm-preview'
+        type: choice
+        options:
+          - dm-preview
+          - dm
+
+jobs:
+  dm-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pick mode
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "cmd=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
+          else
+            echo "cmd=dm" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run DM bot
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_MODEL: ${{ secrets.CLAUDE_MODEL }}
+          SLEEPER_USERNAME: ${{ secrets.SLEEPER_USERNAME }}
+          SLEEPER_LEAGUE_ID: ${{ secrets.SLEEPER_LEAGUE_ID }}
+          SLEEPER_SPORT: nba
+          SLEEPER_SEASON: '2026'
+          SLEEPER_TOKEN: ${{ secrets.SLEEPER_TOKEN }}
+          ENABLE_WRITES: ${{ secrets.ENABLE_WRITES }}
+          ENABLE_TRADE_PROPOSALS: ${{ secrets.ENABLE_TRADE_PROPOSALS }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python run.py ${{ steps.pick.outputs.cmd }}
+
+      - name: Upload audit log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dm-audit-${{ github.run_id }}
+          path: data/audit.log
+          if-no-files-found: ignore
+          retention-days: 30

@@ -1,0 +1,79 @@
+name: Sleeper AI Manager
+
+on:
+  schedule:
+    # Daily waivers + trades at 10:00 UTC = 6:00am ET
+    - cron: '0 10 * * *'
+    # Daily lineup at 11:00 UTC = 7:00am ET
+    - cron: '0 11 * * *'
+  workflow_dispatch:
+    # Lets you trigger either job manually from the Actions tab
+    inputs:
+      command:
+        description: 'Which command to run'
+        required: true
+        default: 'lineup'
+        type: choice
+        options:
+          - lineup
+          - manage
+          - scout
+          - selftest
+          - introspect
+          - dm
+          - dm-preview
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pick command based on trigger
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "cmd=${{ github.event.inputs.command }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "0 10 * * *" ]; then
+            echo "cmd=manage" >> $GITHUB_OUTPUT
+          else
+            echo "cmd=lineup" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run bot
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_MODEL: ${{ secrets.CLAUDE_MODEL }}
+          SLEEPER_USERNAME: ${{ secrets.SLEEPER_USERNAME }}
+          SLEEPER_LEAGUE_ID: ${{ secrets.SLEEPER_LEAGUE_ID }}
+          SLEEPER_SPORT: nba
+          SLEEPER_SEASON: '2026'
+          SLEEPER_TOKEN: ${{ secrets.SLEEPER_TOKEN }}
+          ENABLE_WRITES: ${{ secrets.ENABLE_WRITES }}
+          ENABLE_TRADE_PROPOSALS: ${{ secrets.ENABLE_TRADE_PROPOSALS }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ "${{ steps.pick.outputs.cmd }}" = "introspect" ]; then
+            python introspect.py
+          else
+            python run.py ${{ steps.pick.outputs.cmd }}
+          fi
+
+      - name: Upload audit log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-log-${{ github.run_id }}
+          path: data/audit.log
+          if-no-files-found: ignore
+          retention-days: 30
