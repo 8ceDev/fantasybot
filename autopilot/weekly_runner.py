@@ -16,7 +16,7 @@ from config import (SLEEPER_LEAGUE_ID, SLEEPER_USERNAME, SLEEPER_SPORT,
 from sleeper.read_client import SleeperRead
 from sleeper.write_client import SleeperWrite
 from brain import claude_manager
-from brain.scouting import Scout
+from brain.scouting import Scout, assign_lineup_slots
 from brain.notify import notify
 
 # How long a trade can sit in "negotiate" before we close it out as stale.
@@ -89,9 +89,27 @@ def set_lineup():
         notify(f"Lineup: couldn't parse brain output.\n{rec.get('_raw','')[:400]}")
         return
 
-    starters = rec.get("starters", [])
-    pretty = ", ".join(_name(all_players, pid) for pid in starters)
+    # The brain decides WHO starts; the code decides WHERE each one sits. Sleeper
+    # rejects the entire lineup if any player is in a slot their position can't
+    # fill, so we re-slot from scratch here — placing the brain's picks into legal
+    # slots and backfilling any empty slot with the best eligible bench player.
+    chosen = [str(p) for p in rec.get("starters", [])]
+    pos_by_id = {c["player_id"]: c.get("pos") for c in candidates}
+    unavailable = {"Out", "IR", "Doubtful", "Suspension", "NA", "DNR"}
+    chosen_set = set(chosen)
+    fill_ids = [c["player_id"] for c in candidates          # candidates are best-first
+                if c["player_id"] not in chosen_set and c.get("status") not in unavailable]
+
+    starters, seated, benched, holes = assign_lineup_slots(
+        starting_slots, chosen, pos_by_id, fill_ids=fill_ids)
+
+    pretty = ", ".join(_name(all_players, pid) for pid in starters if pid != "0")
     notify(f"🧠 Lineup decision: {pretty}\n   {rec.get('reason','')}")
+    if benched:
+        notify("   ⚠ couldn't legally seat (no open slot their position fills): "
+               + ", ".join(_name(all_players, p) for p in benched))
+    if holes:
+        notify("   ⚠ empty slot(s) with no eligible player: " + ", ".join(holes))
 
     # re-read roster right before writing so we don't clobber a manual change
     fresh = read.my_roster(SLEEPER_LEAGUE_ID, user_id)
