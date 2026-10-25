@@ -100,48 +100,61 @@ def set_lineup():
     fill_ids = [c["player_id"] for c in candidates          # candidates are best-first
                 if c["player_id"] not in chosen_set and c.get("status") not in unavailable]
 
-    # Debug: log the raw inputs so we can diagnose mismatches between our
-    # eligibility map and what Sleeper actually enforces.
-    notify(f"   [debug] starting_slots={starting_slots}")
-    for pid in chosen:
-        notify(f"   [debug] {_name(all_players, pid)} ({pid}): "
-               f"fantasy_positions={pos_by_id.get(pid)}")
-
     starters, seated, benched, holes = assign_lineup_slots(
         starting_slots, chosen, pos_by_id, fill_ids=fill_ids)
 
-    # Safety: verify every seated player is eligible for their slot BEFORE
-    # submitting, using the STRICTEST interpretation — player's primary
-    # position only — as a fallback when our wider eligibility map doesn't
-    # match Sleeper's actual enforcement.
+    # Safety: verify every seated player is eligible for their slot BEFORE we
+    # submit, so a data mismatch can never push an illegal lineup to Sleeper.
+    from brain.scouting import _slot_allows
     for i, pid in enumerate(starters):
         if pid == "0":
             continue
-        slot = starting_slots[i]
-        pos = pos_by_id.get(pid)
-        from brain.scouting import _slot_allows
-        if not _slot_allows(pos, slot):
-            notify(f"   ✗ PRE-SUBMIT CHECK FAILED: {_name(all_players, pid)} ({pid}) "
-                   f"pos={pos} can't fill slot {slot} — aborting lineup write")
+        if not _slot_allows(pos_by_id.get(pid), starting_slots[i]):
+            notify(f"   ✗ pre-submit check failed: {_name(all_players, pid)} ({pid}) "
+                   f"pos={pos_by_id.get(pid)} can't fill slot {starting_slots[i]} — "
+                   f"aborting lineup write")
             return
 
     pretty = ", ".join(_name(all_players, pid) for pid in starters if pid != "0")
     notify(f"🧠 Lineup decision: {pretty}\n   {rec.get('reason','')}")
-    notify(f"   [debug] starters={starters}")
     if benched:
         notify("   ⚠ couldn't legally seat (no open slot their position fills): "
                + ", ".join(_name(all_players, p) for p in benched))
     if holes:
         notify("   ⚠ empty slot(s) with no eligible player: " + ", ".join(holes))
 
-    # re-read roster right before writing so we don't clobber a manual change
-    fresh = read.my_roster(SLEEPER_LEAGUE_ID, user_id)
-    if fresh.get("starters") == starters:
+    # NBA uses DAILY lineups: a matchup week (the `round`) holds one leg per
+    # scoring day, and each day's leg is edited separately. We were writing to
+    # leg == week, a locked past day → "the move you are trying to make is
+    # illegal". Discover TODAY's leg from Sleeper instead of hardcoding it:
+    # matchup_legs(round=week) returns our roster's legs; state.leg is the
+    # current global day counter that identifies which one is today.
+    round_ = week
+    state_leg = state.get("leg")
+    my_legs = [l for l in write.get_matchup_legs(round_)
+               if l.get("roster_id") == roster["roster_id"]]
+    target = None
+    if state_leg is not None:
+        target = next((l for l in my_legs if l.get("leg") == state_leg), None)
+    if target is None and my_legs:
+        target = max(my_legs, key=lambda l: l.get("leg", 0))   # latest day
+    target_leg = target.get("leg") if target else (state_leg if state_leg is not None else week)
+    notify(f"   [debug] round(week)={round_} state.leg={state_leg} "
+           f"legs_seen={sorted(l.get('leg') for l in my_legs)} → writing leg={target_leg}")
+
+    # Don't clobber an identical lineup. Prefer the leg's own current starters
+    # (authoritative for the day); fall back to the roster-level starters.
+    current = target.get("starters") if target else None
+    if current is None:
+        current = read.my_roster(SLEEPER_LEAGUE_ID, user_id).get("starters")
+    if current == starters:
         notify("   Lineup already matches — nothing to submit.")
         return
+
     write.set_lineup(roster_id=roster["roster_id"],
                      starters=starters,
-                     leg=week,
+                     leg=target_leg,
+                     round_=round_,
                      reserve=rec.get("reserve", []))
 
 
