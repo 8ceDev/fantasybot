@@ -117,8 +117,10 @@ class SleeperWrite:
         leg == round == week, which is why passing them equal used to "work"
         everywhere except daily NBA.
 
-        `reserve` is currently ignored — moving a player to IR is a separate
-        mutation (move_to_ir) that isn't wired up yet.
+        `reserve` is intentionally ignored here — a lineup write is only about
+        the day's starters. Moving a player to IR is a separate mutation
+        (move_to_ir, below); the autopilot calls it directly so the two concerns
+        stay cleanly separated.
         """
         safe_league = _snowflake(self.league_id)
         safe_roster = int(roster_id)
@@ -149,6 +151,55 @@ class SleeperWrite:
         return self._graphql(
             "update_matchup_leg", query, {"starters_games": {}},
             intent=f"set_lineup roster={roster_id} leg={safe_leg} round={safe_round} starters={starters}",
+        )
+
+    def move_to_ir(self, roster_id: int, player_id: str):
+        """Stash a rostered, injured player on IR/reserve, freeing an active
+        roster slot. Sleeper only permits this for a player whose injury status
+        the league's reserve rules allow (e.g. Out / Injured Reserve); it
+        rejects a healthy player, which surfaces here as a GraphQL error the
+        caller catches. Verified against the community SDK
+        (cameron-eth/sleeper-sdk, auth/client.py::move_to_ir)."""
+        safe_player = _safe_player_ids([player_id])[0]
+        query = """
+        mutation move_to_ir($league_id: Snowflake!, $roster_id: Int!, $player_id: String!) {
+          move_to_ir(league_id: $league_id, roster_id: $roster_id, player_id: $player_id) {
+            roster_id reserve
+          }
+        }
+        """
+        variables = {
+            "league_id": _snowflake(self.league_id),
+            "roster_id": int(roster_id),
+            "player_id": safe_player,
+        }
+        return self._graphql(
+            "move_to_ir", query, variables,
+            intent=f"move_to_ir roster={roster_id} player={player_id}",
+        )
+
+    def activate_from_ir(self, roster_id: int, player_id: str):
+        """Bring a player back from IR/reserve onto the active roster. Needs an
+        open active slot — Sleeper rejects it when the active roster is full,
+        surfacing here as a GraphQL error the caller catches (we never drop
+        anyone to make room). Verified against the community SDK
+        (cameron-eth/sleeper-sdk, auth/client.py::activate_from_ir)."""
+        safe_player = _safe_player_ids([player_id])[0]
+        query = """
+        mutation activate_from_ir($league_id: Snowflake!, $roster_id: Int!, $player_id: String!) {
+          activate_from_ir(league_id: $league_id, roster_id: $roster_id, player_id: $player_id) {
+            roster_id reserve players
+          }
+        }
+        """
+        variables = {
+            "league_id": _snowflake(self.league_id),
+            "roster_id": int(roster_id),
+            "player_id": safe_player,
+        }
+        return self._graphql(
+            "activate_from_ir", query, variables,
+            intent=f"activate_from_ir roster={roster_id} player={player_id}",
         )
 
     def waiver_claim(self, roster_id: int, add_player_id: str,
