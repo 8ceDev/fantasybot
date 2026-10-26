@@ -22,6 +22,14 @@ from brain.notify import notify
 # How long a trade can sit in "negotiate" before we close it out as stale.
 NEGOTIATION_MAX_DAYS = 3
 
+# Injury statuses that mean a player can't help the active roster right now.
+# Used both to keep unavailable players out of the lineup/backfill and to decide
+# who is IR-eligible (stashable) vs. healthy enough to activate off IR. Sleeper
+# is the final arbiter of IR-eligibility — we catch any rejection — but gating on
+# these first avoids obviously-doomed attempts (e.g. IR-ing a healthy player).
+UNAVAILABLE = {"Out", "IR", "Injured Reserve", "Doubtful", "Suspension",
+               "NA", "DNR", "Sidelined", "PUP", "COV", "Sus", "Out For Season"}
+
 
 def _dm_text(m: dict) -> str:
     """Extract readable text from a DM message's text_map blob."""
@@ -76,6 +84,77 @@ def _add_player(write, roster_id, add_id, drop_id, faab):
         return False
 
 
+def _reconcile_ir(write, roster, league, all_players, want_reserve):
+    """Make the roster's IR/reserve slots reflect reality, using the real
+    move_to_ir / activate_from_ir mutations (DRY-RUN gated like every write).
+
+      • STASH: players the brain flagged for IR (`want_reserve`) that are
+        genuinely injured and not already on IR get moved to IR. That FREES an
+        active roster slot — which is the whole point: an out-for-weeks body no
+        longer clogs a slot a healthy streamer could score in.
+      • ACTIVATE: players sitting on IR who are healthy again are brought back
+        onto the active roster when there's an open active slot. We never drop
+        anyone to make room — a healthy player with nowhere to land is flagged
+        for a human instead of being stranded on IR.
+
+    Every move is wrapped: Sleeper rejects an IR move for an ineligible player
+    or an activation with no room, and that rejection is logged, never fatal.
+    Returns the set of player_ids moved to IR this run."""
+    positions = (league or {}).get("roster_positions", []) or []
+    ir_cap = len([p for p in positions if p in ("IR", "RES")])
+    active_cap = len([p for p in positions if p not in ("IR", "RES", "TAXI")]) or 14
+
+    def status_of(pid):
+        return (all_players.get(str(pid), {}) or {}).get("injury_status") or "OK"
+
+    reserve = [str(p) for p in (roster.get("reserve") or [])]
+    reserve_set = set(reserve)
+    owned = [str(p) for p in (roster.get("players") or [])]
+    moved_to_ir = set()
+
+    if ir_cap == 0:
+        return moved_to_ir  # league has no IR slot — nothing to reconcile
+
+    # 1) ACTIVATE healthy players off IR into genuinely open active slots.
+    active_now = [p for p in owned if p not in reserve_set]
+    open_active = max(0, active_cap - len(active_now))
+    for pid in reserve:
+        if status_of(pid) in UNAVAILABLE:
+            continue  # still hurt — leave on IR
+        if open_active > 0:
+            notify(f"   🔁 {_name(all_players, pid)} is healthy — activating off IR.")
+            try:
+                write.activate_from_ir(roster["roster_id"], pid)
+                reserve_set.discard(pid)
+                open_active -= 1
+            except RuntimeError as e:
+                notify(f"   ✗ couldn't activate {_name(all_players, pid)}: {e}")
+        else:
+            notify(f"   ⚠ {_name(all_players, pid)} is healthy but the active roster is "
+                   f"full — drop dead weight to bring them back off IR.")
+
+    # 2) STASH injured players the brain wants on IR (each one frees a slot).
+    for pid in [str(p) for p in (want_reserve or []) if p and str(p) != "0"]:
+        if pid in reserve_set or pid not in owned:
+            continue
+        if len(reserve_set) >= ir_cap:
+            notify(f"   ⚠ IR is full ({ir_cap} slot[s]) — can't stash "
+                   f"{_name(all_players, pid)}.")
+            break
+        if status_of(pid) not in UNAVAILABLE:
+            notify(f"   ⚠ not stashing {_name(all_players, pid)} on IR — not listed as "
+                   f"injured/out, so Sleeper won't allow it.")
+            continue
+        notify(f"   🏥 Moving {_name(all_players, pid)} to IR — frees an active slot.")
+        try:
+            write.move_to_ir(roster["roster_id"], pid)
+            reserve_set.add(pid)
+            moved_to_ir.add(pid)
+        except RuntimeError as e:
+            notify(f"   ✗ couldn't move {_name(all_players, pid)} to IR: {e}")
+    return moved_to_ir
+
+
 # Enriched player cards (with real fantasy-point production) are built by the
 # Scout in brain/scouting.py — see scout.cards(). This module only needs plain
 # names for its notifications and trade descriptions.
@@ -117,10 +196,16 @@ def set_lineup():
 
     chosen = [str(p) for p in rec.get("starters", [])]
     pos_by_id = {c["player_id"]: c.get("pos") for c in candidates}
-    unavailable = {"Out", "IR", "Doubtful", "Suspension", "NA", "DNR"}
     chosen_set = set(chosen)
     fill_ids = [c["player_id"] for c in candidates          # candidates are best-first
-                if c["player_id"] not in chosen_set and c.get("status") not in unavailable]
+                if c["player_id"] not in chosen_set and c.get("status") not in UNAVAILABLE]
+
+    # Make the IR/reserve slots reflect reality BEFORE we submit the lineup:
+    # bring any now-healthy player back off IR (into an open active slot) and
+    # stash the injured players the brain flagged for reserve. A stash frees an
+    # active slot the next waiver run fills with a healthy streamer — the real
+    # fix for an out-for-weeks body (e.g. Claxton) clogging the roster.
+    _reconcile_ir(write, roster, league, all_players, rec.get("reserve", []))
 
     # Find the leg we're editing. A matchup week (the `round`) holds the legs;
     # for this league there's one leg per week (weekly lineups). state.leg is
@@ -191,8 +276,7 @@ def set_lineup():
     write.set_lineup(roster_id=roster["roster_id"],
                      starters=starters,
                      leg=target_leg,
-                     round_=round_,
-                     reserve=rec.get("reserve", []))
+                     round_=round_)
 
 
 # ---------------- WAIVERS + TRADES ----------------
@@ -275,11 +359,10 @@ def _handle_waivers(read, write, roster, all_players, scout=None, team_context=N
     # We only ADD (never drop) into genuinely empty slots, using the best
     # available free agents by our scoring, skipping anyone currently unavailable.
     if open_slots > 0:
-        unavailable = {"Out", "IR", "Doubtful", "Suspension", "NA", "DNR"}
         owned = set(str(p) for p in (roster.get("players") or [])) | taken
         fillable = [c for c in fa_top
                     if str(c.get("player_id")) not in owned
-                    and c.get("status") not in unavailable]
+                    and c.get("status") not in UNAVAILABLE]
         if fillable:
             notify(f"🧠 {open_slots} empty roster slot(s) — filling with the best "
                    f"available free agents (no drop, $0).")
