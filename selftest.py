@@ -95,12 +95,19 @@ def main():
     # ---- 3. team context ----
     line()
     print("[3] TEAM CONTEXT")
-    tc = scout.team_context(config.SLEEPER_LEAGUE_ID, roster, user_id, week)
+    reader = (SleeperWrite(config.SLEEPER_TOKEN, config.SLEEPER_LEAGUE_ID, enable_writes=False)
+              if config.SLEEPER_TOKEN else None)   # read-only use: projected score
+    tc = scout.team_context(config.SLEEPER_LEAGUE_ID, roster, user_id, week, write=reader)
     print(f"  record: {tc.get('my_record')}   rank: {tc.get('my_rank')}")
     cm = tc.get("current_matchup")
     if cm:
-        print(f"  this week vs {cm['opponent']}: "
+        print(f"  this week vs {cm['opponent']}: banked "
               f"you {cm['my_points_this_week']} — them {cm['opponent_points_this_week']}")
+        if cm.get("my_projected_this_week") is not None:
+            print(f"  projected final: you {cm['my_projected_this_week']} — "
+                  f"them {cm['opponent_projected_this_week']}")
+        else:
+            print("  projected final: (unavailable — needs SLEEPER_TOKEN)")
         tops = ", ".join(f"{p['name']} ({p.get('fpts_per_game') or p.get('proj_fpts_per_game') or '?'})"
                          for p in cm.get("opponent_top_players", []))
         print(f"  their danger men: {tops}")
@@ -110,6 +117,31 @@ def main():
         print("  standings top 5:")
         for r in tc["standings"][:5]:
             print(f"    {r['rank']:>2}. {r['team'][:22]:22} {r['record']:>6}  pf={r['pts_for']}")
+
+    # ---- 3b. this week: schedule, games left, lineup locks ----
+    line()
+    print("[3b] THIS WEEK — NBA schedule, games left, lineup locks (weekly lineups)")
+    from sleeper.nba_schedule import load_week_schedule
+    from brain.scouting import week_value
+    sched = load_week_schedule()
+    print(f"  {sched.summary()}")
+    mine = (read.my_matchup(config.SLEEPER_LEAGUE_ID, week, roster["roster_id"]) or {}).get("mine") or {}
+    played = {str(p) for p, v in (mine.get("players_points") or {}).items() if v}
+    starters = {str(p) for p in (roster.get("starters") or [])}
+    print(f"  {'player':22} {'team':5} {'slot':7} {'games left':>10} {'rest-of-week pts':>17}  lock")
+    for c in sorted(cards, key=lambda c: -(week_value(c, sched.games_left(c.get('team'))) or 0)):
+        gl = sched.games_left(c.get("team"))
+        if c["player_id"] in played:
+            lock = "LOCKED (has played)"
+        elif sched.known and sched.started_this_week(c.get("team")):
+            lock = "locked? (team tipped off)"
+        else:
+            lock = "movable"
+        print(f"  {c['name'][:22]:22} {str(c.get('team')):5} "
+              f"{'START' if c['player_id'] in starters else 'bench':7} "
+              f"{('?' if gl is None else gl):>10} {week_value(c, gl):>17}  {lock}")
+    if not sched.known:
+        print("  ⚠️  schedule didn't load — the bot will rank by per-game value until it does.")
 
     # ---- 4. trades + DMs visible (counts only) ----
     line()
