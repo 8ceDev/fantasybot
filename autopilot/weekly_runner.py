@@ -85,11 +85,25 @@ def _add_player(write, roster_id, add_id, drop_id, faab):
 
     The waiver->free_agent fallback is a DIFFERENT mutation, not a retry of the
     same write, so it's safe (see write_client docstring #3)."""
+    def _locked_drop(err):
+        m = str(err).lower()
+        return "locked" in m and "lineup" in m
+
     try:
         write.waiver_claim(roster_id=roster_id, add_player_id=add_id,
                            drop_player_id=drop_id, faab_bid=int(faab or 0))
         return True
     except RuntimeError as e:
+        # The player we're dropping is locked into the current lineup — Sleeper
+        # refuses it, and the free-agent fallback would fail identically, so
+        # don't bother retrying. Report it as what it is (a lineup problem: the
+        # bot is starting a player it wants to drop) rather than the misleading
+        # "not on waivers" message the generic fallback would print.
+        if _locked_drop(e):
+            notify("   ✗ Can't drop that player — they're locked into the current "
+                   "starting lineup. Skipping this move until they're benched "
+                   "(the lineup shouldn't start a player we want to cut).")
+            return False
         msg = str(e).lower()
         if any(k in msg for k in ("waiver", "claim", "passed", "free agent")):
             notify("   ↳ Not on waivers — adding directly as a free agent.")
@@ -98,10 +112,41 @@ def _add_player(write, roster_id, add_id, drop_id, faab):
                                      drop_player_id=drop_id)
                 return True
             except RuntimeError as e2:
-                notify(f"   ✗ Free-agent add also failed: {e2}")
+                if _locked_drop(e2):
+                    notify("   ✗ Can't drop that player — they're locked into the "
+                           "current starting lineup. Skipping until they're benched.")
+                else:
+                    notify(f"   ✗ Free-agent add also failed: {e2}")
                 return False
         notify(f"   ✗ Waiver claim failed: {e}")
         return False
+
+
+def _open_active_slots(roster, league):
+    """How many active roster slots are open right now (players we can add
+    WITHOUT dropping). Mirrors the math in _handle_waivers; IR/reserve players
+    sit in separate slots and don't count against the active cap."""
+    positions = (league or {}).get("roster_positions", []) or []
+    active_cap = len([p for p in positions if p not in ("IR", "RES", "TAXI")]) or 14
+    reserve_ids = set(str(p) for p in (roster.get("reserve") or []))
+    active = [p for p in (roster.get("players") or []) if str(p) not in reserve_ids]
+    return max(0, active_cap - len(active))
+
+
+def _trade_net_roster_change(trade, roster_id):
+    """Net change to MY roster size if this trade processes: players coming TO me
+    minus players leaving me. Positive means I need that many open slots (or must
+    drop that many more players) for Sleeper to be able to process it."""
+    def _mine(d):
+        n = 0
+        for rid in (d or {}).values():
+            try:
+                if int(rid) == int(roster_id):
+                    n += 1
+            except (TypeError, ValueError):
+                pass
+        return n
+    return _mine(trade.get("adds")) - _mine(trade.get("drops"))
 
 
 def _reconcile_ir(write, roster, league, all_players, want_reserve):
@@ -422,6 +467,7 @@ def _handle_trades(read, write, roster, all_players, user_id, week, preview=Fals
                        negotiation path to carry (and possibly close with a counter).
     """
     scout = scout or Scout(read, league=read.league(SLEEPER_LEAGUE_ID))
+    league = scout.league if isinstance(getattr(scout, "league", None), dict) else read.league(SLEEPER_LEAGUE_ID)
     rosters = read.rosters(SLEEPER_LEAGUE_ID)
     roster_by_id = {r["roster_id"]: r for r in rosters}
     name_by_uid = {str(u.get("user_id")): u.get("display_name")
@@ -524,6 +570,22 @@ def _handle_trades(read, write, roster, all_players, user_id, week, preview=Fals
                 reach = "" if dm else "  (no reachable DM — would skip send)"
                 notify(f"    💬 WOULD {decision.upper()} + DM: {dm_message}{reach}")
             continue
+
+        # ROSTER-SPACE PRE-CHECK (accepts only). A trade that brings in more
+        # players than it sends out can only process if we have that many open
+        # slots. Accepting one we can't absorb records our consent but Sleeper
+        # never processes it — and we used to fire off a "Done, pleasure doing
+        # business" DM anyway, telling a leaguemate a deal closed when it hadn't.
+        # So if it won't fit, leave it pending and send NO DM, rather than lie.
+        if decision == "accept":
+            need = _trade_net_roster_change(t, roster["roster_id"])
+            open_slots = _open_active_slots(roster, league)
+            if need > open_slots:
+                notify(f"    ⚠ Holding trade {tx_id}: it nets +{need} player(s) but "
+                       f"only {open_slots} slot(s) are open, so Sleeper can't process "
+                       f"it without dropping {need - open_slots} more first. Not "
+                       f"accepting and not DMing until roster space is freed.")
+                continue  # leave it pending; never DM a deal we can't actually close
 
         if decision in ("accept", "reject"):
             try:
