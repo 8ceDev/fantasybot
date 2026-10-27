@@ -129,22 +129,20 @@ class Scout:
         except Exception:
             return {}
 
-    def _cumulative_matchup_points(self, write, round_) -> dict:
-        """Sum each roster's points across EVERY leg (scoring day) of the round,
-        returning {roster_id: total}. This is the true weekly head-to-head total
-        the Sleeper app shows.
+    def _projected_matchup_points(self, write, round_) -> dict:
+        """Projected FINAL points per roster for the matchup period, returning
+        {roster_id: projected_total}.
 
-        Why this exists: for a daily-scoring NBA league the public REST endpoint
-        /league/{id}/matchups/{week} returns only a SINGLE leg — one day's
-        scoring — in its `points` field, NOT the week's running total. Reading
-        that single day made the brain think it was winning (e.g. "up 91-73" on a
-        good night) while the week as a whole was a blowout loss (153-224), which
-        in turn made it play passively instead of chasing the deficit. The
-        authenticated matchup_legs query returns one row per day per roster, each
-        with its own `points`; summing them per roster reproduces the app's
-        cumulative score. Best-effort: {} if the legs call is unavailable (no
-        token / GraphQL failure), so the caller simply keeps the single-day REST
-        number rather than breaking."""
+        Why this exists: the public /matchups/{week} endpoint only reports points
+        ACTUALLY banked so far (e.g. you up 92-78 early in the week). But the
+        number Sleeper's app headlines — and bases its win-odds on — is the
+        PROJECTED final (e.g. you 153 vs them 224, a 17% chance to win), because
+        the opponent has more scoring still to come. The brain was reading only
+        the banked number and getting complacent about a lead it is projected to
+        lose. The authenticated matchup_legs query exposes `proj_points` per leg;
+        summing per roster reproduces the app's projected score. Best-effort: {}
+        if the legs call is unavailable (no token / GraphQL failure), in which
+        case the caller just omits the projection rather than breaking."""
         if write is None:
             return {}
         try:
@@ -154,9 +152,10 @@ class Scout:
         totals = {}
         for leg in (legs or []):
             rid = leg.get("roster_id")
-            if rid is None:
+            pp = leg.get("proj_points")
+            if rid is None or pp is None:
                 continue
-            totals[rid] = totals.get(rid, 0.0) + float(leg.get("points") or 0)
+            totals[rid] = totals.get(rid, 0.0) + float(pp)
         return {rid: round(v, 2) for rid, v in totals.items()}
 
     def team_context(self, league_id: str, my_roster: dict, user_id: str,
@@ -207,33 +206,26 @@ class Scout:
             # opponent's most dangerous players, by our scoring
             opp_top = self.cards(opp_roster.get("players") or [])[:5]
 
-            # Single-day figures the REST /matchups/{week} endpoint returns for a
-            # daily NBA league — kept ONLY as a fallback.
+            # ACTUAL points banked so far this week (public /matchups endpoint).
+            # Early in the week this favors whoever has already played — you can
+            # lead here and still be the underdog.
             my_points = round(float(mine.get("points") or 0), 2)
             opp_points = round(float(opp.get("points") or 0), 2)
-            # Prefer the cumulative weekly total (summed across all legs/days),
-            # which matches the app and is what the brain must actually reason
-            # about. The opponent pairing from REST is reliable; only the points
-            # were wrong, so we reuse the pairing and overwrite just the totals.
-            cumulative = self._cumulative_matchup_points(write, week)
-            if cumulative:
-                my_points = cumulative.get(my_rid, my_points)
-                opp_points = cumulative.get(opp_rid, opp_points)
-                # "weekly total ..." + a 0-0 value means legs WERE summed and the
-                # week is genuinely scoreless so far (fresh week, no games yet) —
-                # not a broken sum. A nonzero value is the normal healthy case.
-                score_source = "weekly total (all days summed)"
-            else:
-                # The legs call returned nothing, so we're showing a single day.
-                # If this shows mid-week with real games played, that's the signal
-                # the authenticated legs read is failing and needs a look.
-                score_source = "single-day fallback (no legs returned)"
+            # PROJECTED final points (authenticated matchup_legs.proj_points) —
+            # the number the app headlines and bases win-odds on. This is what
+            # actually decides the matchup, so the brain needs it: you can be up
+            # on banked points but projected to lose because the opponent has
+            # more scoring left. None when the legs read is unavailable.
+            proj = self._projected_matchup_points(write, week)
+            my_proj = proj.get(my_rid)
+            opp_proj = proj.get(opp_rid)
 
             ctx["current_matchup"] = {
                 "opponent": opp_owner,
                 "my_points_this_week": my_points,
                 "opponent_points_this_week": opp_points,
-                "score_source": score_source,
+                "my_projected_this_week": my_proj,
+                "opponent_projected_this_week": opp_proj,
                 "opponent_top_players": [
                     {"name": c["name"], "fpts_per_game": c.get("fpts_per_game"),
                      "proj_fpts_per_game": c.get("proj_fpts_per_game")}
