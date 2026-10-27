@@ -129,9 +129,45 @@ class Scout:
         except Exception:
             return {}
 
-    def team_context(self, league_id: str, my_roster: dict, user_id: str, week: int) -> dict:
+    def _cumulative_matchup_points(self, write, round_) -> dict:
+        """Sum each roster's points across EVERY leg (scoring day) of the round,
+        returning {roster_id: total}. This is the true weekly head-to-head total
+        the Sleeper app shows.
+
+        Why this exists: for a daily-scoring NBA league the public REST endpoint
+        /league/{id}/matchups/{week} returns only a SINGLE leg — one day's
+        scoring — in its `points` field, NOT the week's running total. Reading
+        that single day made the brain think it was winning (e.g. "up 91-73" on a
+        good night) while the week as a whole was a blowout loss (153-224), which
+        in turn made it play passively instead of chasing the deficit. The
+        authenticated matchup_legs query returns one row per day per roster, each
+        with its own `points`; summing them per roster reproduces the app's
+        cumulative score. Best-effort: {} if the legs call is unavailable (no
+        token / GraphQL failure), so the caller simply keeps the single-day REST
+        number rather than breaking."""
+        if write is None:
+            return {}
+        try:
+            legs = write.get_matchup_legs(round_)
+        except Exception:
+            return {}
+        totals = {}
+        for leg in (legs or []):
+            rid = leg.get("roster_id")
+            if rid is None:
+                continue
+            totals[rid] = totals.get(rid, 0.0) + float(leg.get("points") or 0)
+        return {rid: round(v, 2) for rid, v in totals.items()}
+
+    def team_context(self, league_id: str, my_roster: dict, user_id: str,
+                     week: int, write=None) -> dict:
         """Everything about the team's situation: scoring rules, record, rank,
-        the live matchup it's trying to win this week, and the standings."""
+        the live matchup it's trying to win this week, and the standings.
+
+        `write` (optional) is the authenticated client. When supplied, the live
+        matchup score is the CUMULATIVE weekly total summed across every scoring
+        day (what the app shows); without it we fall back to the single-day REST
+        figure. See _cumulative_matchup_points for why that distinction matters."""
         ctx = {"scoring_rules": explain_weights(), "week": week}
         names = self._owner_names(league_id)
         my_rid = my_roster.get("roster_id")
@@ -164,15 +200,30 @@ class Scout:
         if mu and mu.get("opp"):
             opp = mu["opp"]
             mine = mu.get("mine", {})
+            opp_rid = opp.get("roster_id")
             opp_roster = next((r for r in self.read.rosters(league_id)
-                               if r.get("roster_id") == opp.get("roster_id")), {})
-            opp_owner = names.get(str(opp_roster.get("owner_id")), f'roster {opp.get("roster_id")}')
+                               if r.get("roster_id") == opp_rid), {})
+            opp_owner = names.get(str(opp_roster.get("owner_id")), f'roster {opp_rid}')
             # opponent's most dangerous players, by our scoring
             opp_top = self.cards(opp_roster.get("players") or [])[:5]
+
+            # Single-day figures the REST /matchups/{week} endpoint returns for a
+            # daily NBA league — kept ONLY as a fallback.
+            my_points = round(float(mine.get("points") or 0), 2)
+            opp_points = round(float(opp.get("points") or 0), 2)
+            # Prefer the cumulative weekly total (summed across all legs/days),
+            # which matches the app and is what the brain must actually reason
+            # about. The opponent pairing from REST is reliable; only the points
+            # were wrong, so we reuse the pairing and overwrite just the totals.
+            cumulative = self._cumulative_matchup_points(write, week)
+            if cumulative:
+                my_points = cumulative.get(my_rid, my_points)
+                opp_points = cumulative.get(opp_rid, opp_points)
+
             ctx["current_matchup"] = {
                 "opponent": opp_owner,
-                "my_points_this_week": round(float(mine.get("points") or 0), 2),
-                "opponent_points_this_week": round(float(opp.get("points") or 0), 2),
+                "my_points_this_week": my_points,
+                "opponent_points_this_week": opp_points,
                 "opponent_top_players": [
                     {"name": c["name"], "fpts_per_game": c.get("fpts_per_game"),
                      "proj_fpts_per_game": c.get("proj_fpts_per_game")}
