@@ -59,21 +59,23 @@ def _name(all_players, pid):
 
 
 def _notify_matchup(team_context):
-    """Surface the live weekly head-to-head the brain is reasoning about, so a
-    wrong or stale score is obvious in the run log instead of hiding inside the
-    brain's prose. This prints the CUMULATIVE weekly total (summed across every
-    scoring day), which is what team_context now feeds the brain — a single-day
-    snapshot used to leak through here and read as a phantom lead."""
+    """Surface the head-to-head the brain is reasoning about, showing BOTH the
+    points banked so far and Sleeper's projected final. The two can disagree
+    sharply early in the week (lead on banked points, underdog on projection),
+    and the projection is what the matchup actually comes down to — so printing
+    both makes the bot's reasoning legible instead of hiding a phantom lead."""
     cm = (team_context or {}).get("current_matchup")
     if not cm:
         return
     me = cm.get("my_points_this_week")
     them = cm.get("opponent_points_this_week")
-    verb = "up" if (me or 0) >= (them or 0) else "down"
     wk = (team_context or {}).get("week")
-    src = cm.get("score_source", "")
-    notify(f"   📊 Week {wk} vs {cm.get('opponent', 'opponent')}: "
-           f"{verb} {me}-{them}  [{src}]")
+    line = f"   📊 Week {wk} vs {cm.get('opponent', 'opponent')}: banked {me}-{them}"
+    mp, op = cm.get("my_projected_this_week"), cm.get("opponent_projected_this_week")
+    if mp is not None and op is not None:
+        fav = "favored" if (mp or 0) >= (op or 0) else "UNDERDOG"
+        line += f"  |  projected {mp}-{op} ({fav})"
+    notify(line)
 
 
 def _add_player(write, roster_id, add_id, drop_id, faab):
