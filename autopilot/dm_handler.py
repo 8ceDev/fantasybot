@@ -18,7 +18,12 @@ from config import (SLEEPER_LEAGUE_ID, SLEEPER_USERNAME, SLEEPER_SPORT,
                     ENABLE_TRADE_PROPOSALS)
 from sleeper.read_client import SleeperRead
 from sleeper.write_client import SleeperWrite
-from autopilot.weekly_runner import _handle_trades
+from autopilot.weekly_runner import _handle_trades, _open_active_slots
+
+# The 20-minute DM job only (re)evaluates trade offers this fresh. Older open
+# offers are re-checked by the daily manage run instead — otherwise every open
+# offer was sent to Claude ~72 times a day for the same answer.
+TRADE_FRESH_MINUTES = 75
 from brain import claude_manager
 from brain.scouting import Scout
 from brain.notify import notify
@@ -87,14 +92,19 @@ def handle_dms(preview: bool = False):
     my_rid = my_roster.get("roster_id")
 
     week = (read.state() or {}).get("week", 1)
-    team_context = scout.team_context(SLEEPER_LEAGUE_ID, my_roster, my_user_id, week)
+    # `write` adds Sleeper's projected final, so negotiations know whether
+    # we're actually ahead or just ahead on points banked so far.
+    team_context = scout.team_context(SLEEPER_LEAGUE_ID, my_roster, my_user_id, week,
+                                      write=write)
+    open_roster_slots = _open_active_slots(my_roster, league)
 
     # 1) Formal trades — accept / reject here; negotiate cases are handed back
     #    for the conversation (and possible counter-proposal) below.
     try:
         resolved, negotiate_map = _handle_trades(read, write, my_roster, all_players,
                                                   my_user_id, week, preview=preview,
-                                                  scout=scout, team_context=team_context)
+                                                  scout=scout, team_context=team_context,
+                                                  fresh_minutes=TRADE_FRESH_MINUTES)
     except Exception as e:
         notify(f"DM bot: trade pass errored: {e}")
         resolved, negotiate_map = set(), {}
@@ -195,6 +205,7 @@ def handle_dms(preview: bool = False):
             "their_name": other_name,
             "dm_history": convo,
             "incoming_trade": negotiate_map.get(other_id),
+            "open_roster_slots": open_roster_slots,
             "team_context": team_context,
         })
         reply = rec.get("message", "")
@@ -216,6 +227,14 @@ def handle_dms(preview: bool = False):
         if wants_propose and not valid_deal:
             notify(f"    ⚠ {other_name}: proposal referenced players not on the "
                    f"right rosters — ignoring the proposal, just replying.")
+
+        # A deal that brings in more players than it sends can't process on a
+        # full roster — proposing it would just create another stuck trade.
+        net_in = len(recv_ids) - len(send_ids)
+        if valid_deal and net_in > open_roster_slots:
+            notify(f"    ⚠ {other_name}: deal nets +{net_in} player(s) but only "
+                   f"{open_roster_slots} roster slot(s) are open — not proposing it.")
+            valid_deal = False
 
         already_out = their_rid in outbound_rids
 
