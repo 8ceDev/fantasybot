@@ -429,14 +429,16 @@ class SleeperWrite:
     def get_matchup_legs(self, round_: int):
         """Read every matchup leg in a round (matchup week).
 
-        For NBA this returns one leg per scoring DAY per roster; each leg object
-        carries its own `leg` number, `roster_id`, `round`, and current
-        `starters`. This is how we discover the correct leg to write today
-        instead of hardcoding leg == week. Best-effort: [] on any failure."""
+        Each leg object carries its own `leg` number, `roster_id`, `round`,
+        `starters`, and two score fields that matter: `points` (actual scored —
+        can be null until a leg finalizes) and `proj_points` (Sleeper's PROJECTED
+        total, which is what the app headlines and bases win-odds on). We use it
+        both to discover the correct leg to write and to read the projection the
+        public matchups endpoint doesn't expose. Best-effort: [] on any failure."""
         query = """
         query matchup_legs($round: Int) {
           matchup_legs(league_id: "%s", round: $round) {
-            leg matchup_id roster_id round starters points
+            leg matchup_id roster_id round starters points proj_points
           }
         }
         """ % _snowflake(self.league_id)
