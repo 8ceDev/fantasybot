@@ -235,6 +235,47 @@ class Scout:
         return ctx
 
 
+# ---------- weekly value ----------
+# This league uses WEEKLY lineups: a starting slot earns every game its player
+# plays this week, and a player locks in at his first tip-off. So a player's
+# lineup value is per-game value x games left this week — never "does he play
+# tonight". These helpers turn a player card into that number.
+
+# Statuses that mean "probably plays, but discount the risk".
+_RISKY = {"Questionable": 0.85, "DTD": 0.85, "GTD": 0.85, "Day-To-Day": 0.85,
+          "Probable": 0.95}
+
+
+def fpg_estimate(card: dict) -> float:
+    """Best single per-game estimate: real production blended with the
+    projection, trusting actuals more as the sample grows. Two or three games
+    into a season the actual number is mostly noise, so the projection carries
+    it; by ~15 games the actuals have taken over."""
+    actual = card.get("fpts_per_game")
+    proj = card.get("proj_fpts_per_game")
+    gp = card.get("games_played") or 0
+    if actual is not None and proj:
+        w = min(1.0, gp / 15.0)
+        return round(w * float(actual) + (1 - w) * float(proj), 2)
+    if actual is not None:
+        return float(actual)
+    return float(proj or 0.0)
+
+
+def status_multiplier(status) -> float:
+    return _RISKY.get(status or "OK", 1.0)
+
+
+def week_value(card: dict, games_left) -> float:
+    """Expected fantasy points from starting this player for the rest of the
+    week. With no schedule (games_left None) it degrades to per-game value,
+    i.e. every player is assumed to have the same number of games left."""
+    base = fpg_estimate(card) * status_multiplier(card.get("status"))
+    if games_left is None:
+        return round(base, 2)
+    return round(base * max(0, int(games_left)), 2)
+
+
 # ---------- lineup slotting ----------
 # Sleeper rejects a whole lineup with "the move you are trying to make is
 # illegal" the moment ONE player sits in a slot their position can't fill (a
