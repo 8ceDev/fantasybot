@@ -219,11 +219,21 @@ class Scout:
             if cumulative:
                 my_points = cumulative.get(my_rid, my_points)
                 opp_points = cumulative.get(opp_rid, opp_points)
+                # "weekly total ..." + a 0-0 value means legs WERE summed and the
+                # week is genuinely scoreless so far (fresh week, no games yet) —
+                # not a broken sum. A nonzero value is the normal healthy case.
+                score_source = "weekly total (all days summed)"
+            else:
+                # The legs call returned nothing, so we're showing a single day.
+                # If this shows mid-week with real games played, that's the signal
+                # the authenticated legs read is failing and needs a look.
+                score_source = "single-day fallback (no legs returned)"
 
             ctx["current_matchup"] = {
                 "opponent": opp_owner,
                 "my_points_this_week": my_points,
                 "opponent_points_this_week": opp_points,
+                "score_source": score_source,
                 "opponent_top_players": [
                     {"name": c["name"], "fpts_per_game": c.get("fpts_per_game"),
                      "proj_fpts_per_game": c.get("proj_fpts_per_game")}
