@@ -70,8 +70,10 @@ def _notify_matchup(team_context):
     me = cm.get("my_points_this_week")
     them = cm.get("opponent_points_this_week")
     verb = "up" if (me or 0) >= (them or 0) else "down"
-    notify(f"   📊 Week so far vs {cm.get('opponent', 'opponent')}: "
-           f"{verb} {me}-{them} (total across every day this week)")
+    wk = (team_context or {}).get("week")
+    src = cm.get("score_source", "")
+    notify(f"   📊 Week {wk} vs {cm.get('opponent', 'opponent')}: "
+           f"{verb} {me}-{them}  [{src}]")
 
 
 def _add_player(write, roster_id, add_id, drop_id, faab):
@@ -521,10 +523,29 @@ def _handle_trades(read, write, roster, all_players, user_id, week, preview=Fals
                 notify(f"    💬 WOULD {decision.upper()} + DM: {dm_message}{reach}")
             continue
 
-        if decision == "accept":
-            write.respond_to_trade(transaction_id=tx_id, leg=leg, accept=True)
-        elif decision == "reject":
-            write.respond_to_trade(transaction_id=tx_id, leg=leg, accept=False)
+        if decision in ("accept", "reject"):
+            try:
+                write.respond_to_trade(transaction_id=tx_id, leg=leg,
+                                       accept=(decision == "accept"))
+            except RuntimeError as e:
+                # RACE: a leaguemate can withdraw/cancel an offer (or it can
+                # expire, or be resolved elsewhere) in the gap between our fetch
+                # and our write. Sleeper then refuses with "Trade is no longer
+                # proposed. It's status is now cancelled." For a REJECT that's
+                # already the outcome we wanted; for an ACCEPT the offer is
+                # simply gone. Either way it is a no-op — NOT a reason to abort
+                # the whole manage run, which is exactly what used to happen
+                # (one stale offer crashed every trade and everything after it).
+                msg = str(e).lower()
+                gone = any(k in msg for k in (
+                    "no longer proposed", "status is now", "cancel", "already",
+                    "not proposed", "expired", "no longer", "does not exist"))
+                if gone:
+                    notify(f"    ↷ Trade {tx_id} already withdrawn/expired — "
+                           f"nothing to {decision}, skipping.")
+                else:
+                    notify(f"    ✗ couldn't {decision} trade {tx_id}: {e}")
+                continue  # one bad trade must never kill the cycle
 
         if dm and dm_message:
             try:
