@@ -25,6 +25,7 @@ Monday). Every date here is an Eastern calendar date.
 """
 
 import datetime as dt
+import time
 
 import requests
 
@@ -36,9 +37,24 @@ except Exception:  # pragma: no cover — tz database missing; close enough
 
 NBA_CDN_SCHEDULE = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
 ESPN_SCOREBOARD = ("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
-                   "scoreboard?dates={ymd}")
-_HEADERS = {"user-agent": "Mozilla/5.0 (sleeper-ai-manager schedule fetch)",
-            "accept": "application/json"}
+                   "scoreboard?dates={ymd}&limit=100")
+# A realistic browser identity. The first attempt from the GitHub Actions runner
+# failed two ways that both trace back to headers/size: ESPN returned 403 (its
+# WAF blocks non-browser user-agents from datacenter IPs) and cdn.nba.com's full
+# season file (~4 MB) read-timed-out at 20s. So: look like Chrome, accept gzip
+# (the file compresses to ~1 MB), and give each source a longer read window with
+# one retry. Per-site Referer/Origin added at call time.
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+_HEADERS = {
+    "user-agent": _UA,
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "en-US,en;q=0.9",
+    "accept-encoding": "gzip, deflate, br",
+    "cache-control": "no-cache",
+}
+_CONNECT_TIMEOUT = 10
+_RETRIES = 1          # one extra attempt per source on a transient failure
 
 # Sources (and Sleeper) don't all agree on team codes — normalize everything to
 # one canonical tricode so a player's `team` always matches a schedule entry.
@@ -59,6 +75,15 @@ def norm_team(code):
         return None
     c = str(code).strip().upper()
     return _ALIASES.get(c, c)
+
+
+def _is_hard_reject(e):
+    """A 403/404 won't improve on retry; timeouts and 5xx might."""
+    resp = getattr(e, "response", None)
+    if resp is not None and getattr(resp, "status_code", None) in (403, 404):
+        return True
+    m = str(e).lower()
+    return "403" in m or "404" in m or "forbidden" in m or "not found" in m
 
 
 def _parse_utc(value):
@@ -146,21 +171,45 @@ class WeekSchedule:
         self.source = None
         self.error = None
         self._http = session or requests
-        self._timeout = timeout
+        self._timeout = timeout          # read timeout for the per-day ESPN calls
+        self._sleep = time.sleep
 
     # ---- loading ----
-    def _get_json(self, url):
-        r = self._http.get(url, headers=_HEADERS, timeout=self._timeout)
-        r.raise_for_status()
-        return r.json()
+    def _get_json(self, url, read_timeout, referer=None):
+        """GET JSON with browser headers, a connect+read timeout, and one retry
+        on a transient failure (timeout / connection reset / 5xx). A 403 or 404
+        is not retried — more tries won't change a hard rejection."""
+        headers = dict(_HEADERS)
+        if referer:
+            headers["referer"] = referer
+            headers["origin"] = referer.rstrip("/")
+        last = None
+        for attempt in range(_RETRIES + 1):
+            try:
+                r = self._http.get(url, headers=headers,
+                                   timeout=(_CONNECT_TIMEOUT, read_timeout))
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:
+                last = e
+                if _is_hard_reject(e) or attempt >= _RETRIES:
+                    raise
+                self._sleep(1.5)
+        raise last
 
     def _load_nba_cdn(self):
-        return parse_nba_cdn(self._get_json(NBA_CDN_SCHEDULE), self.week_start, self.week_end)
+        # One request for the whole season (so mid-week games-left is accurate),
+        # but it's a big file — give it a long read window.
+        data = self._get_json(NBA_CDN_SCHEDULE, read_timeout=45,
+                               referer="https://www.nba.com/")
+        return parse_nba_cdn(data, self.week_start, self.week_end)
 
     def _load_espn(self):
         out, day = [], self.week_start
         while day <= self.week_end:           # all-or-nothing: a missing day would
-            data = self._get_json(ESPN_SCOREBOARD.format(ymd=day.strftime("%Y%m%d")))
+            data = self._get_json(ESPN_SCOREBOARD.format(ymd=day.strftime("%Y%m%d")),
+                                  read_timeout=self._timeout,
+                                  referer="https://www.espn.com/")
             out.extend(parse_espn(data, day))  # silently undercount games left
             day += dt.timedelta(days=1)
         return out
