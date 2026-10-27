@@ -516,6 +516,81 @@ def _report_lineup(plan, starting_slots, committed, card_by_id, all_players, rec
     notify("\n".join(lines))
 
 
+def _enforce_roster_limit(read, write, roster, league, all_players, scout, sched, week):
+    """If the roster is OVER the active limit, clear the overage so Sleeper stops
+    blocking every move. While you're over, Sleeper refuses ALL writes — lineup,
+    waiver, trade — with "You are over the roster limit of N. Please drop some
+    players before making any moves." (You can land here when a trade processes
+    more players in than out.) This gets you legal again, brain-free so it works
+    even with the Claude API down:
+      1. IR every injured player there's room for — frees a slot, KEEPS the player.
+      2. Drop the lowest-value BENCH players (never a current starter, never one
+         locked into this week) until legal.
+    If IR + bench drops still aren't enough — i.e. the only bodies left to cut are
+    players you're actively starting — it STOPS and flags for a human rather than
+    cutting someone you're using. A drop reduces the roster, so Sleeper permits it
+    even while you're over; that's exactly what it's asking for.
+    Returns True if it changed the roster (so the caller re-fetches)."""
+    positions = (league or {}).get("roster_positions", []) or []
+    active_cap = len([p for p in positions if p not in ("IR", "RES", "TAXI")]) or 14
+    ir_cap = len([p for p in positions if p in ("IR", "RES")])
+    reserve = {str(p) for p in (roster.get("reserve") or [])}
+    active = [str(p) for p in (roster.get("players") or []) if str(p) not in reserve and str(p) != "0"]
+    over = len(active) - active_cap
+    if over <= 0:
+        return False
+
+    notify(f"   ⚠ Roster is {over} OVER the {active_cap}-man limit — Sleeper blocks "
+           f"every move (lineup/waiver/trade) until that's fixed. Clearing it now.")
+
+    def status_of(pid):
+        return (all_players.get(str(pid), {}) or {}).get("injury_status") or "OK"
+
+    cards = scout.cards(active)
+    val = {c["player_id"]: fpg_estimate(c) for c in cards}
+    committed = {str(p) for p in (roster.get("starters") or []) if p and str(p) != "0"}
+    try:
+        played = _played_this_week(read, week, roster)
+    except Exception:
+        played = set()
+    locked = _lock_ids(active, {c["player_id"]: c for c in cards}, played, sched, conservative=True)
+    changed = False
+
+    # 1) IR injured players (lowest value first) — keeps them, frees a slot.
+    ir_room = ir_cap - len(reserve)
+    for pid in sorted((p for p in active if status_of(p) in UNAVAILABLE), key=lambda p: val.get(p, 0)):
+        if over <= 0 or ir_room <= 0:
+            break
+        try:
+            write.move_to_ir(roster["roster_id"], pid)
+            notify(f"   🏥 Moved {_name(all_players, pid)} (injured) to IR — keeps him, frees a slot.")
+            active.remove(pid); over -= 1; ir_room -= 1; changed = True
+        except Exception as e:
+            notify(f"   ✗ couldn't IR {_name(all_players, pid)}: {e}")
+
+    # 2) Drop the lowest-value BENCH players (never a starter, never locked).
+    drop = getattr(write, "drop_player", None)
+    bench = sorted((p for p in active if p not in committed and p not in locked),
+                   key=lambda p: val.get(p, 0))
+    for pid in bench:
+        if over <= 0:
+            break
+        try:
+            drop(roster["roster_id"], pid) if drop else \
+                write.add_free_agent(roster_id=roster["roster_id"], drop_player_id=pid)
+            notify(f"   ➖ Dropped {_name(all_players, pid)} (lowest bench value, "
+                   f"~{val.get(pid, 0)} fpg) to get under the limit.")
+            active.remove(pid); over -= 1; changed = True
+        except Exception as e:
+            notify(f"   ✗ couldn't drop {_name(all_players, pid)}: {e}")
+
+    if over > 0:
+        notify(f"   ⚠ Still {over} over after IR + bench drops — the only players left "
+               f"to cut are ones you're starting, so I won't cut them automatically. "
+               f"Drop {over} in the app and the bot can move again.")
+    return changed
+
+
 def set_lineup():
     read, write, user_id = _ctx()
     league = read.league(SLEEPER_LEAGUE_ID)
@@ -528,6 +603,9 @@ def set_lineup():
     all_players = read.all_players()
     scout = Scout(read, league=league)
     sched = _load_schedule()
+    # An over-limit roster blocks the lineup write too, so clear it first.
+    if _enforce_roster_limit(read, write, roster, league, all_players, scout, sched, week):
+        roster = read.my_roster(SLEEPER_LEAGUE_ID, user_id) or roster
 
     # starting slots only — BN/IR/RES/TAXI are filled by whoever isn't starting
     all_positions = league.get("roster_positions", [])
@@ -631,6 +709,9 @@ def manage_team():
     # trades. `write` lets team_context include Sleeper's projected final score.
     scout = Scout(read, league=league)
     sched = _load_schedule()
+    # An over-limit roster blocks waivers AND trades, so clear it before anything.
+    if _enforce_roster_limit(read, write, roster, league, all_players, scout, sched, week):
+        roster = read.my_roster(SLEEPER_LEAGUE_ID, user_id) or roster
     week_ctx = _week_ctx(read, write, scout, roster, week, state, user_id, league, sched)
     team_context = scout.team_context(SLEEPER_LEAGUE_ID, roster, user_id, week, write=write)
     team_context["week_info"] = week_ctx["info"]
