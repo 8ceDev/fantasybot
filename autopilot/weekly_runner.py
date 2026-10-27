@@ -58,6 +58,22 @@ def _name(all_players, pid):
     return p.get("full_name") or pid
 
 
+def _notify_matchup(team_context):
+    """Surface the live weekly head-to-head the brain is reasoning about, so a
+    wrong or stale score is obvious in the run log instead of hiding inside the
+    brain's prose. This prints the CUMULATIVE weekly total (summed across every
+    scoring day), which is what team_context now feeds the brain — a single-day
+    snapshot used to leak through here and read as a phantom lead."""
+    cm = (team_context or {}).get("current_matchup")
+    if not cm:
+        return
+    me = cm.get("my_points_this_week")
+    them = cm.get("opponent_points_this_week")
+    verb = "up" if (me or 0) >= (them or 0) else "down"
+    notify(f"   📊 Week so far vs {cm.get('opponent', 'opponent')}: "
+           f"{verb} {me}-{them} (total across every day this week)")
+
+
 def _add_player(write, roster_id, add_id, drop_id, faab):
     """Submit an add (with optional drop), falling back to an instant free-agent
     add when the player isn't on waivers. Returns True on success. Never raises —
@@ -183,11 +199,15 @@ def set_lineup():
     all_positions = league.get("roster_positions", [])
     starting_slots = [p for p in all_positions if p not in ("BN", "IR", "RES", "TAXI")]
 
+    # `write` lets team_context sum the week's legs into the real cumulative
+    # score (what the app shows) instead of a single day's snapshot.
+    tctx = scout.team_context(SLEEPER_LEAGUE_ID, roster, user_id, week, write=write)
+    _notify_matchup(tctx)
     rec = claude_manager.lineup_decision({
         "starting_slots": starting_slots,
         "num_starters_required": len(starting_slots),
         "candidates": candidates,
-        "team_context": scout.team_context(SLEEPER_LEAGUE_ID, roster, user_id, week),
+        "team_context": tctx,
     })
 
     if rec.get("_parse_error"):
@@ -290,9 +310,13 @@ def manage_team():
         notify("Couldn't find your roster — has the draft happened yet?")
         return
     all_players = read.all_players()
-    # one Scout (and one team-context snapshot) shared by waivers + trades
+    # one Scout (and one team-context snapshot) shared by waivers + trades.
+    # `write` lets team_context report the cumulative weekly score (all days),
+    # not a single day's REST snapshot — the difference between the brain
+    # thinking it's winning and knowing it has to chase a deficit.
     scout = Scout(read, league=league)
-    team_context = scout.team_context(SLEEPER_LEAGUE_ID, roster, user_id, week)
+    team_context = scout.team_context(SLEEPER_LEAGUE_ID, roster, user_id, week, write=write)
+    _notify_matchup(team_context)
 
     _handle_waivers(read, write, roster, all_players, scout, team_context)
     _handle_trades(read, write, roster, all_players, user_id, week,
