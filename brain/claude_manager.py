@@ -142,9 +142,23 @@ def _ctx_block(context: dict) -> str:
     cm = tc.get("current_matchup")
     if cm:
         lines.append(
-            f"- This week you're playing {cm.get('opponent')}: "
-            f"you {cm.get('my_points_this_week')} vs them {cm.get('opponent_points_this_week')}."
+            f"- This week you're playing {cm.get('opponent')}. Points banked so "
+            f"far: you {cm.get('my_points_this_week')} vs them "
+            f"{cm.get('opponent_points_this_week')}."
         )
+        mp, op = cm.get("my_projected_this_week"), cm.get("opponent_projected_this_week")
+        if mp is not None and op is not None:
+            if mp >= op:
+                verdict = f"you're PROJECTED TO WIN by {round(mp - op, 1)}"
+            else:
+                verdict = f"you're PROJECTED TO LOSE by {round(op - mp, 1)}"
+            lines.append(
+                f"- Projected final: you {mp} vs them {op} — {verdict}. The "
+                f"projection, not the points already banked, is what the matchup "
+                f"comes down to (your opponent may have far more scoring still to "
+                f"play). Do not sit on a banked lead you're projected to lose — "
+                f"act to raise your projected total (add games/scoring)."
+            )
         if cm.get("opponent_top_players"):
             tops = ", ".join(
                 f"{p['name']} ({p.get('fpts_per_game') or p.get('proj_fpts_per_game') or '?'} fpg)"
