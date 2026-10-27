@@ -108,14 +108,14 @@ class SleeperWrite:
                    round_: int = None, reserve: list = None):
         """Set the starting lineup for a specific matchup leg.
 
-        NBA uses DAILY lineups: a matchup period (the `round`, = state.week)
-        contains one `leg` per scoring day, and each day's leg is edited
-        separately. Writing to the wrong leg — e.g. the week number, which is a
-        past/locked day — fails with "the move you are trying to make is
-        illegal". So `leg` must be the CURRENT day's leg (from matchup_legs /
-        state.leg), and `round` the matchup week. For weekly sports (NFL, EPL)
-        leg == round == week, which is why passing them equal used to "work"
-        everywhere except daily NBA.
+        A matchup period is a `round` (= state.week) holding one or more `legs`.
+        This league uses WEEKLY lineups, so there is one leg per round and
+        leg == round == week (confirmed live: state week=2, leg=2, and
+        matchup_legs(round=2) returns exactly one leg per roster). The caller
+        still looks the leg up from matchup_legs / state.leg rather than assume
+        it, because a write aimed at the wrong leg fails with "the move you are
+        trying to make is illegal". Players lock at their first tip-off of the
+        week; moving a locked player is also rejected as illegal.
 
         `reserve` is intentionally ignored here — a lineup write is only about
         the day's starters. Moving a player to IR is a separate mutation
@@ -285,6 +285,40 @@ class SleeperWrite:
             "league_create_transaction", query, variables,
             intent=f"free_agent add={add_player_id} drop={drop_player_id}",
         )
+
+    def drop_player(self, roster_id: int, player_id: str):
+        """Drop a player outright (no add) — used to make roster room for an
+        accepted trade. Tries the same free-agent transaction the add path uses;
+        if Sleeper rejects that shape with a GraphQL error that ISN'T about the
+        player being locked, falls back to create_free_agent, the drop mutation
+        verified against the community SDK (cameron-eth/sleeper-sdk,
+        auth/client.py::add_drop). That's a different mutation after a definitive
+        rejection, not a blind retry (see docstring #3); network errors are
+        re-raised untouched because then we can't know whether it went through."""
+        try:
+            return self.add_free_agent(roster_id=roster_id, add_player_id=None,
+                                       drop_player_id=player_id)
+        except RuntimeError as e:
+            if "lock" in str(e).lower():
+                raise
+            first = e
+        safe_player = _safe_player_ids([player_id])[0]
+        query = """
+        mutation create_free_agent($league_id: Snowflake!, $roster_id: Int!,
+                                   $adds: JSON, $drops: JSON) {
+          create_free_agent(league_id: $league_id, roster_id: $roster_id,
+                            adds: $adds, drops: $drops) {
+            transaction_id status type created adds drops
+          }
+        }
+        """
+        variables = {"league_id": _snowflake(self.league_id), "roster_id": int(roster_id),
+                     "adds": {}, "drops": {safe_player: int(roster_id)}}
+        try:
+            return self._graphql("create_free_agent", query, variables,
+                                 intent=f"drop roster={roster_id} player={player_id} (fallback)")
+        except RuntimeError as e2:
+            raise RuntimeError(f"{first} | fallback create_free_agent: {e2}")
 
     def respond_to_trade(self, transaction_id: str, leg: int, accept: bool):
         """Accept or reject a trade someone proposed to you."""
