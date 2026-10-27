@@ -21,10 +21,10 @@ SYSTEM = f"""You are an elite fantasy basketball general manager running a team 
 
 LEAGUE CONTEXT:
 - 18 teams (deeper than standard; waiver wire is thin, roster depth matters)
-- Roster: 9 starters (PG, SG, G, SF, PF, F, C, UTIL, UTIL) plus a bench and a reserve/IR slot. NEVER leave an active roster slot empty — an empty slot scores zero every day. If you have an open slot, add the best available free agent to fill it even if no drop is needed.
+- Roster: 9 starters (PG, SG, G, SF, PF, F, C, UTIL, UTIL) plus a bench and a reserve/IR slot. NEVER leave an active roster slot empty — an empty slot scores zero. If you have an open slot, add the best available free agent to fill it even if no drop is needed.
 - $100 FAAB waiver budget for the entire season
 - Trade deadline: league week 18
-- Bench locks on game start (no late swaps)
+- WEEKLY LINEUPS — the most important rule in this league. There is ONE lineup per matchup week (Mon–Sun). A starting slot earns EVERY game its player plays that week, and each player locks into his slot (starter or bench) at his first tip-off of the week and stays there for the rest of the week. So a player's lineup value = his per-game fantasy points x games he has LEFT this week. Whether someone plays TONIGHT is irrelevant: never bench a better player because he has no game today, and never start a worse one because he does — the moment the worse player tips off he is stuck in that slot all week, and the better player is shut out. A player locked into the starting lineup also can't be dropped until the week ends.
 
 {ANALYST_FRAMEWORK}
 
@@ -45,8 +45,9 @@ weeks. Never blow the budget early on marginal upgrades.
 WEB SEARCH — you have a live web_search tool. Basketball changes daily, and
 your training knowledge is stale, so BEFORE deciding you must look up anything
 time-sensitive you don't reliably know for TODAY:
-  - Tonight's NBA schedule — which of the relevant players actually play today
-    (and who's on a back-to-back). This is critical for daily lineups.
+  - This week's schedule only if it's missing — you are normally handed
+    games_left_this_week for every player (computed from the real NBA
+    schedule); trust it. Back-to-backs/rest days still matter for stars.
   - Current injury status, minutes, and starting role (search "<player> injury
     status" / "<team> starting lineup tonight").
   - Recent form, usage, and role changes over the last week or two.
@@ -56,7 +57,7 @@ find, and don't search for timeless facts you already know. Prefer recent,
 reputable sources (ESPN, Rotowire, official team/NBA pages, beat writers).
 
 REASONING PROCESS — follow before every decision:
-  Step 1 — What is the actual goal? (optimize daily lineup, fill PG hole, etc.)
+  Step 1 — What is the actual goal? (maximize this week's points, fill a PG hole, etc.)
   Step 2 — Search for the live facts that bear on it (schedule, injuries, form).
   Step 3 — What are the top 2-3 options?
   Step 4 — For each: estimate expected fantasy points under THIS league's scoring,
@@ -139,6 +140,18 @@ def _ctx_block(context: dict) -> str:
     lines = ["TEAM CONTEXT (your situation right now):"]
     if tc.get("my_record"):
         lines.append(f"- Record: {tc['my_record']} (rank {tc.get('my_rank', '?')})")
+    wi = tc.get("week_info")
+    if wi:
+        parts = [f"week {wi.get('week')}"]
+        if wi.get("days_left_including_today") is not None:
+            parts.append(f"{wi['days_left_including_today']} day(s) left including today")
+        if wi.get("starting_slots_total"):
+            parts.append(f"{wi.get('starting_slots_still_open')} of "
+                         f"{wi.get('starting_slots_total')} starting slots still open "
+                         f"(the rest are locked in until the week ends)")
+        if wi.get("schedule"):
+            parts.append(wi["schedule"])
+        lines.append("- This matchup week: " + "; ".join(parts) + ".")
     cm = tc.get("current_matchup")
     if cm:
         lines.append(
@@ -194,28 +207,50 @@ def draft_pick(context: dict) -> dict:
 
 # ---------- LINEUP ----------
 def lineup_decision(context: dict) -> dict:
-    """context: {starting_slots, num_starters_required, candidates}
-    Returns {"starters": [player_id,...ordered by slot], "reserve": [...], "reason": ..., "analysis": ...}"""
-    n = context.get("num_starters_required")
-    slots = context.get("starting_slots", [])
+    """Weekly-lineup advisor. The CODE optimizes the lineup (per-game value x
+    games left, position-legal, locks respected); the brain supplies the news
+    the numbers can't see.
+
+    context: {starting_slots, open_slots, locked, candidates, team_context}
+    Returns {"starters": [preferred player_ids for the open slots, best first],
+             "exclude": [{"player_id", "reason"}], "reserve": [...],
+             "analysis": ..., "reason": ...}"""
+    open_slots = context.get("open_slots", [])
     prompt = (
         f"{_ctx_block(context)}"
-        f"Pick my optimal {n} starters for today. I have more players than "
-        f"starting slots — the rest go to the bench automatically. DO NOT "
-        f"include bench players in the starters array. Bench anyone not "
-        f"playing today, ruled out, injured, or clearly worse than the "
-        f"alternatives at their position.\n\n"
-        f"Starting slots (in order, one player per slot): {json.dumps(slots)}\n\n"
-        f"My full roster to choose from:\n{json.dumps(context.get('candidates', []), indent=2)}\n\n"
-        f'CRITICAL: "starters" must be an array of EXACTLY {n} player_ids, '
-        f'one per starting slot in the order listed above. Any player you '
-        f'leave out automatically goes to the bench — do NOT list bench '
-        f'players anywhere. "reserve" is ONLY for players headed to IR '
-        f'(injured/out long-term), or empty [] if none.\n\n'
-        f'Respond as JSON: {{"starters": [{n} player_ids], '
-        f'"reserve": [IR-bound player_ids, or empty], '
-        f'"analysis": "<2-4 sentences on your lineup logic — who you benched and why>", '
-        f'"reason": "<1 sentence summary>"}}'
+        "Set my lineup for the REST OF THIS WEEK.\n\n"
+        "HOW IT WORKS (read carefully): lineups here are WEEKLY. Each starting "
+        "slot earns every game its player plays this week, and a player locks "
+        "into his slot (starter or bench) at his first tip-off of the week. "
+        "Locked slots below can't change. For every OPEN slot, the code will "
+        "start the movable players with the most projected rest-of-week points "
+        "(value_rest_of_week = per-game value x games_left_this_week), position-"
+        "legal. Whether a player plays TONIGHT does not matter — only how many "
+        "games he has left and how good he is per game.\n\n"
+        "YOUR JOB is the judgment the numbers can't make:\n"
+        "  1. Use web search to check CURRENT news for the top movable "
+        "candidates: injuries, rest/load management, minutes restrictions, a "
+        "lost starting role. A player Sleeper still lists as healthy may be out.\n"
+        '  2. "exclude": anyone who must NOT start despite his numbers, each with '
+        "a concrete news-based reason. Never exclude a player just because he "
+        "has no game today.\n"
+        '  3. "starters": the movable players you want in the open slots, best '
+        "first. This only breaks near-ties; it can't override a big gap in "
+        "projected points — use exclude for that.\n"
+        '  4. "reserve": players to move to IR (genuinely injured / out long-term), '
+        "else [].\n\n"
+        f"Starting slots (in order): {json.dumps(context.get('starting_slots', []))}\n"
+        f"OPEN slots you're filling now: {json.dumps(open_slots)}\n"
+        f"LOCKED for the rest of the week (can't change): "
+        f"{json.dumps(context.get('locked', []))}\n\n"
+        "My roster (locked_this_week=true means he can't move; "
+        "games_left_this_week=null means the schedule was unavailable, so compare "
+        f"per-game value):\n{json.dumps(context.get('candidates', []), indent=2)}\n\n"
+        'Respond as JSON: {"starters": [player_ids for the open slots, best first], '
+        '"exclude": [{"player_id": "<id>", "reason": "<news-based reason>"}], '
+        '"reserve": [IR-bound player_ids, or empty], '
+        '"analysis": "<2-4 sentences: who fills the open slots and why, citing games '
+        'left and any news>", "reason": "<1 sentence summary>"}'
     )
     return _ask(prompt)
 
@@ -230,6 +265,16 @@ def waiver_decision(context: dict) -> dict:
         "are a real upgrade. For each claim give the player to add, the player "
         "to drop (or null if I have an open slot), and a sensible FAAB bid from "
         "my remaining budget. It's fine to make zero claims — don't force moves.\n\n"
+        "WEEKLY-LINEUP REALITY: an added player can only score THIS week if he "
+        "takes one of the starting slots that are still open (see TEAM CONTEXT) "
+        "and has games left (games_left_this_week). Otherwise he's an investment "
+        "for next week onward — value him on rest-of-season production, and bid "
+        "accordingly. Players with locked_this_week=true and in_starting_lineup="
+        "true are locked into this week's lineup and CANNOT be dropped.\n"
+        "The drop MUST come from this list of players I can drop right now "
+        f"(least valuable first): {json.dumps(context.get('droppable_player_ids', []))}. "
+        "If the player you'd want to cut isn't on it, either cut someone who is, "
+        "or skip the claim this cycle.\n\n"
         f"My roster:\n{json.dumps(context.get('your_roster', []), indent=2)}\n\n"
         f"Top available free agents (pre-scored, best first):\n"
         f"{json.dumps(context.get('free_agents_top', [])[:30], indent=2)}\n\n"
@@ -319,6 +364,15 @@ def evaluate_trade(context: dict) -> dict:
         f"Their roster:\n{json.dumps(context.get('their_roster', []), indent=2)}\n\n"
         f"Who I'm dealing with: {context.get('their_name', 'a leaguemate')}\n"
         f"Our recent DM history (oldest first), if any:\n{context.get('dm_history', '(none)')}\n\n"
+        f"ROSTER ROOM: {json.dumps(context.get('roster_room') or {})}\n"
+        "If must_drop_to_accept > 0, Sleeper can't process this trade unless I "
+        "first drop that many players. You may still ACCEPT, but then you MUST "
+        "list exactly that many player_ids in drop_to_make_room, chosen ONLY from "
+        "droppable_least_valuable_first — and the trade must still be clearly "
+        "worth it AFTER losing them. Filler 'depth pieces' are worth little to me "
+        "if I have to cut real players to fit them. If it's not worth it with the "
+        "drops, NEGOTIATE instead (e.g. ask for the deal without the filler) or "
+        "REJECT. If must_drop_to_accept is 0, leave drop_to_make_room empty.\n\n"
         "Also write dm_message: the actual message to send them, IN CHARACTER as a "
         "terse, cocky, old-school talent-scout GM. 1-2 sentences MAX, usually one. "
         "ACCEPT -> a curt confirmation. NEGOTIATE -> state plainly what would make "
@@ -326,7 +380,8 @@ def evaluate_trade(context: dict) -> dict:
         "snarky, dismissive brush-off that insults the OFFER, not the person. No "
         "emoji unless mocking. Don't restate full rosters.\n\n"
         'Respond as JSON: {"decision": "accept"|"negotiate"|"reject", '
-        '"analysis": "<3-5 sentences weighing the value>", '
+        '"drop_to_make_room": [player_ids to drop if accepting needs room, else []], '
+        '"analysis": "<3-5 sentences weighing the value, including any drops>", '
         '"reason": "<1 sentence summary for the log>", '
         '"dm_message": "<the in-character message to send them>"}'
     )
@@ -371,6 +426,12 @@ def negotiate(context: dict) -> dict:
         f"{json.dumps(context.get('incoming_trade') or {}, indent=2)}\n\n"
         f"Our FULL DM conversation (oldest first) — read all of it; more than one "
         f"trade idea may have been floated:\n{context.get('dm_history', '(none)')}\n\n"
+        f"ROSTER ROOM: I have {context.get('open_roster_slots', 0)} open roster slot(s). "
+        "Sleeper can't process a trade that leaves my roster over the limit, so "
+        "never close a deal where I receive more players than I send unless I "
+        "have that many open slots — keep deals player-count-balanced (or receive "
+        "fewer) otherwise. Players locked into this week's lineup can't move "
+        "until the week ends.\n\n"
         "Decide your next move. If they've clearly agreed to concrete terms good "
         "for me, CLOSE IT (propose=true with exact player_ids). Otherwise keep "
         "negotiating (propose=false). Make sure you've addressed every trade idea "
